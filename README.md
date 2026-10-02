@@ -26,8 +26,9 @@ If images sit in `images/train`, `images/val`, `images/test` (e.g. HIT-UAV), tha
 **HIT-UAV**
 ```bash
 python validate_dataset.py --images hit-uav/images --labels hit-uav/labels \
-    --out hit_manifest.csv --clean-out clean_hit
+    --out hit_manifest.csv --clean-out clean_hit --keep-classes person
 ```
+`--keep-classes person` keeps only Person boxes (renumbered to class 0) in the cleaned copy; images with no people stay as negative samples. Validation still checks every class in the source.
 
 **Training / testing** — the `--clean-out` dir is a ready Ultralytics dataset:
 ```bash
