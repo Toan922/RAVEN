@@ -364,14 +364,40 @@ def load_session_metadata(path):
     return out
 
 
+def load_yolo_names(path):
+    """Class names from a YOLO dataset.yaml, `names:` as an indented mapping
+    or an inline list. Hand-parsed to avoid a PyYAML dependency."""
+    if not path or not os.path.exists(path):
+        return []
+    names, in_names = {}, False
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.split("#")[0].rstrip()
+            if s.startswith("names:"):
+                rest = s[len("names:"):].strip()
+                if rest.startswith("["):
+                    return [x.strip().strip("'\"") for x in rest.strip("[]").split(",")
+                            if x.strip()]
+                in_names = True
+            elif in_names and s[:1] in (" ", "\t") and ":" in s:
+                k, v = s.split(":", 1)
+                names[int(k)] = v.strip().strip("'\"")
+            elif s.strip():
+                in_names = False
+    return [names[k] for k in sorted(names)]
+
+
 def load_coco(path):
     """labels.json is COCO detection format. Return filename -> record with
-    boxes already converted to normalised YOLO (class ids shifted to 0-based),
-    plus the category table."""
+    boxes already converted to normalised YOLO (category ids remapped to
+    0..n-1 in id order, so 0- and 1-based files both work), plus the
+    category table."""
     if not path or not os.path.exists(path):
         return {}, []
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
+    cat_index = {c["id"]: i for i, c in
+                 enumerate(sorted(raw.get("categories", []), key=lambda c: c["id"]))}
     by_id = {}
     for im in raw.get("images", []):
         by_id[im["id"]] = {
@@ -386,9 +412,10 @@ def load_coco(path):
             continue
         x, y, w, h = a["bbox"]
         W, H = rec["width"] or 1, rec["height"] or 1
-        rec["boxes"].append((int(a["category_id"]) - 1,
+        rec["boxes"].append((cat_index.get(a["category_id"], int(a["category_id"]) - 1),
                              (x + w / 2) / W, (y + h / 2) / H, w / W, h / H))
-    return {r["file_name"]: r for r in by_id.values()}, raw.get("categories", [])
+    return {r["file_name"]: r for r in by_id.values()}, \
+        sorted(raw.get("categories", []), key=lambda c: c["id"])
 
 
 def enrich_rows(rows, labels_dir, meta, coco):
@@ -629,7 +656,7 @@ def materialize(src, dst, mode):
     return "copy"
 
 
-def write_clean_dataset(rows, labels_dir, meta, categories, args):
+def write_clean_dataset(rows, labels_dir, meta, class_names, args):
     out = args.clean_out
     src_root = os.path.abspath(args.images)
     if os.path.abspath(out) == src_root or \
@@ -682,8 +709,8 @@ def write_clean_dataset(rows, labels_dir, meta, categories, args):
     # the ground truth cannot drift apart again.
     with open(os.path.join(out, "labels.json"), "w", encoding="utf-8") as f:
         json.dump({"images": coco_images, "annotations": coco_anns,
-                   "categories": categories or
-                   [{"id": 1, "name": "person", "supercategory": ""}]}, f)
+                   "categories": [{"id": i + 1, "name": n, "supercategory": ""}
+                                  for i, n in enumerate(class_names)]}, f)
 
     if meta:
         kept_names = {os.path.basename(r["rel_path"]) for r in kept}
@@ -709,24 +736,25 @@ def write_clean_dataset(rows, labels_dir, meta, categories, args):
         wri.writeheader()
         wri.writerows(dropped)
 
-    if args.splits:
-        os.makedirs(os.path.join(out, "splits"), exist_ok=True)
-        for name in ("train", "val", "test"):
-            sel = [r for r in kept if r["split"] == name]
-            if not sel:
-                continue
-            with open(os.path.join(out, "splits", f"{name}.txt"), "w") as f:
-                for r in sel:
-                    f.write(f'./images/{r["rel_path"]}\n')
-        names = [n for n in ("train", "val", "test")
-                 if any(r["split"] == n for r in kept)]
-        with open(os.path.join(out, "dataset.yaml"), "w") as f:
-            f.write("path: .\n")
+    names = [n for n in ("train", "val", "test")
+             if any(r["split"] == n for r in kept)]
+    if names:
+        # Lists live at the dataset root: Ultralytics resolves "./" in a list
+        # file relative to that file's own directory.
+        for name in names:
+            with open(os.path.join(out, f"{name}.txt"), "w", newline="\n") as f:
+                for r in kept:
+                    if r["split"] == name:
+                        f.write(f'./images/{r["rel_path"].replace(os.sep, "/")}\n')
+        # Absolute path: Ultralytics resolves a relative `path:` against its
+        # global datasets dir, not the yaml's location. Re-run to relocate.
+        with open(os.path.join(out, "dataset.yaml"), "w", newline="\n") as f:
+            f.write(f"path: {os.path.abspath(out)}\n")
             for n in names:
-                f.write(f"{n}: splits/{n}.txt\n")
-            f.write("names:\n")
-            for cat in (categories or [{"id": 1, "name": "person"}]):
-                f.write(f'  {cat["id"] - 1}: {cat["name"]}\n')
+                f.write(f"{n}: {n}.txt\n")
+            f.write(f"nc: {len(class_names)}\nnames:\n")
+            for i, n in enumerate(class_names):
+                f.write(f"  {i}: {n}\n")
 
     return kept, dropped, link_kinds, boxes_written, boxes_dropped
 
@@ -735,7 +763,7 @@ def write_clean_report(path, rows, kept, dropped, link_kinds,
                        boxes_written, boxes_dropped, conflicts, args, split_counts):
     lines = []
     add = lines.append
-    add("clean_AIResQ -- generated by validate_dataset.py")
+    add(f"{os.path.basename(os.path.abspath(args.clean_out))} -- generated by validate_dataset.py")
     add(f"source images : {os.path.abspath(args.images)}")
     add(f"source labels : {os.path.abspath(args.labels) if args.labels else '(none)'}")
     add("the source tree was opened read-only; nothing in it was modified.")
@@ -765,7 +793,8 @@ def write_clean_report(path, rows, kept, dropped, link_kinds,
         add("  adding files here is safe; editing an image in place would also")
         add("  change the AIResQ copy. Re-run with --link copy to decouple.")
     if split_counts:
-        add(f"splits (group-aware, seed {args.seed}): {split_counts}")
+        how = f"group-aware, seed {args.seed}" if args.splits else "from source folders"
+        add(f"splits ({how}): {split_counts}")
     add("")
     add("layout:")
     add("  images/        kept frames")
@@ -774,6 +803,8 @@ def write_clean_report(path, rows, kept, dropped, link_kinds,
     add("  metadata.json  session attributes, filtered to kept frames")
     add("  manifest.csv   every input row incl. keep/drop_reason/group_id")
     add("  dropped.csv    the dropped rows only")
+    if split_counts:
+        add("  {train,val,test}.txt + dataset.yaml   YOLO/Ultralytics entry point")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     return "\n".join(lines)
@@ -782,7 +813,7 @@ def write_clean_report(path, rows, kept, dropped, link_kinds,
 def summarize(rows, pairs, out_prefix, blur_pct):
     n = len(rows)
     ok = [r for r in rows if r["status"] == "ok"]
-    print(f"\n{'='*64}\nAIResQ validation summary  --  {n} files\n{'='*64}")
+    print(f"\n{'='*64}\ndataset validation summary  --  {n} files\n{'='*64}")
 
     bad = Counter(r["status"] for r in rows if r["status"] != "ok")
     print(f"decoded cleanly      : {len(ok)}/{n}")
@@ -809,6 +840,13 @@ def summarize(rows, pairs, out_prefix, blur_pct):
     exact = sum(c - 1 for c in dupes.values() if c > 1)
     print(f"\nexact duplicates (sha256) : {exact} redundant files")
     print(f"near-duplicate pairs      : {len(pairs)}")
+    spans = defaultdict(set)
+    for r in ok:
+        if r["split"] and r["group_size"] and int(r["group_size"]) > 1:
+            spans[r["group_id"]].add(r["split"])
+    if spans:
+        leaky = sum(len(s) > 1 for s in spans.values())
+        print(f"duplicate groups crossing splits: {leaky}  (train/test leakage)")
 
     if any(r["label_status"] for r in rows):
         print("\nlabels:")
@@ -867,7 +905,7 @@ def main():
     ap.add_argument("--images", required=True)
     ap.add_argument("--labels", default=None, help="YOLO .txt label dir (optional)")
     ap.add_argument("--classes", type=int, default=None,
-                    help="default: derived from labels.json, else 2")
+                    help="default: derived from dataset.yaml or labels.json, else 2")
     ap.add_argument("--out", default="manifest.csv")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1))
     ap.add_argument("--near-dup-hamming", type=int, default=4,
@@ -878,6 +916,7 @@ def main():
     # -- AIResQ sidecars: default to the files that sit next to the image dir
     ap.add_argument("--coco", default=None, help="labels.json (COCO ground truth)")
     ap.add_argument("--metadata", default=None, help="metadata.json (session attrs)")
+    ap.add_argument("--yaml", default=None, help="YOLO dataset.yaml (class names)")
     # -- cleaning
     ap.add_argument("--clean-out", default=None,
                     help="write a cleaned copy of the dataset to this NEW dir")
@@ -895,17 +934,21 @@ def main():
     args = ap.parse_args()
 
     parent = os.path.dirname(os.path.abspath(args.images))
-    for attr, default in (("coco", "labels.json"), ("metadata", "metadata.json")):
+    for attr, default in (("coco", "labels.json"), ("metadata", "metadata.json"),
+                          ("yaml", "dataset.yaml")):
         if getattr(args, attr) is None:
             cand = os.path.join(parent, default)
             setattr(args, attr, cand if os.path.exists(cand) else None)
 
     meta = load_session_metadata(args.metadata)
     coco, categories = load_coco(args.coco)
+    class_names = load_yolo_names(args.yaml) or [c["name"] for c in categories]
     if args.classes is None:
-        args.classes = max((c["id"] for c in categories), default=2)
-    print(f"sidecars: metadata={len(meta)} filenames, "
-          f"coco={len(coco)} images, classes={args.classes}")
+        args.classes = len(class_names) or 2
+    if len(class_names) < args.classes:
+        class_names += [f"class{i}" for i in range(len(class_names), args.classes)]
+    print(f"sidecars: metadata={len(meta)} filenames, coco={len(coco)} images, "
+          f"classes={args.classes} {class_names}")
 
     fractions = [float(x) for x in args.splits.split(",")] if args.splits else []
     if fractions and abs(sum(fractions) - 1.0) > 1e-6:
@@ -931,12 +974,19 @@ def main():
                 print(f"  {i}/{len(files)}", flush=True)
 
     enrich_rows(rows, args.labels, meta, coco)
+    # Datasets shipped pre-split (images/train/..., e.g. HIT-UAV) keep that
+    # split unless --splits asks for a fresh one.
+    for r in rows:
+        top = r["rel_path"].split(os.sep)[0]
+        if top in ("train", "val", "test"):
+            r["split"] = top
 
     pairs = near_duplicate_pairs(rows, args.near_dup_hamming) \
         if args.near_dup_hamming > 0 else []
     sha_groups, clusters = build_groups(rows, pairs)
     conflicts = choose_keepers(rows, sha_groups, clusters, args.labels, args)
-    split_counts = assign_splits(rows, fractions, args.seed) if fractions else {}
+    split_counts = assign_splits(rows, fractions, args.seed) if fractions else \
+        dict(Counter(r["split"] for r in rows if r["keep"] and r["split"]))
 
     with open(args.out, "w", newline="") as f:
         wri = csv.DictWriter(f, fieldnames=FIELDS)
@@ -955,7 +1005,7 @@ def main():
 
     if args.clean_out:
         kept, dropped, kinds, bw, bd = write_clean_dataset(
-            rows, args.labels, meta, categories, args)
+            rows, args.labels, meta, class_names, args)
         report = write_clean_report(
             os.path.join(args.clean_out, "clean_report.txt"), rows, kept, dropped,
             kinds, bw, bd, conflicts, args, split_counts)

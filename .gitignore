@@ -1,6 +1,8 @@
 # datasets (too large / not ours to redistribute)
 AIResQ/
 clean_AIResQ/
+hit-uav/
+clean_*/
 quality_examples/
 quality_examples.zip
 *.csv
