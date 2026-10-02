@@ -564,6 +564,9 @@ def choose_keepers(rows, sha_groups, clusters, labels_dir, args):
         elif r["coco_status"] in ("missing", "size-mismatch",
                                   "count-mismatch", "coord-mismatch"):
             drop(r, f'coco:{r["coco_status"]}')
+        elif args.drop_negatives and not any(
+                int(c) in args.class_map for c in str(r["class_ids"]).split(",") if c):
+            drop(r, "background")
 
     conflicts = 0
     for members in sha_groups.values():
@@ -656,12 +659,34 @@ def materialize(src, dst, mode):
     return "copy"
 
 
+def cleaned_label(r, labels_dir, args):
+    """Source YOLO boxes -> kept classes only, renumbered, clamped, de-duped.
+    Returns (boxes, n_other_class_removed, n_degenerate_removed)."""
+    boxes = read_yolo_boxes(
+        os.path.join(labels_dir, os.path.splitext(r["rel_path"])[0] + ".txt")
+    ) if labels_dir else []
+    n_in = len(boxes)
+    boxes = [(args.class_map[c], *xywh) for c, *xywh in boxes if c in args.class_map]
+    filtered = n_in - len(boxes)
+    boxes, nd = clean_boxes(boxes, args.min_box_frac, args.drop_tiny_boxes)
+    return boxes, filtered, nd
+
+
+def write_yolo_txt(path, boxes):
+    with open(path, "w", newline="\n") as f:
+        for c, x, y, w, h in boxes:
+            f.write(f"{c} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n")
+
+
+def check_out_dir(args):
+    out, src_root = os.path.abspath(args.clean_out), os.path.abspath(args.images)
+    if out == src_root or out.startswith(src_root + os.sep):
+        sys.exit(f"--clean-out must be outside the source image tree ({src_root})")
+
+
 def write_clean_dataset(rows, labels_dir, meta, class_names, args):
     out = args.clean_out
-    src_root = os.path.abspath(args.images)
-    if os.path.abspath(out) == src_root or \
-       os.path.abspath(out).startswith(src_root + os.sep):
-        sys.exit(f"--clean-out must be outside the source image tree ({src_root})")
+    check_out_dir(args)
 
     img_dir, lab_dir = os.path.join(out, "images"), os.path.join(out, "labels")
     os.makedirs(img_dir, exist_ok=True)
@@ -679,22 +704,15 @@ def write_clean_dataset(rows, labels_dir, meta, class_names, args):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         link_kinds[materialize(r["path"], dst, args.link)] += 1
 
-        boxes = read_yolo_boxes(
-            os.path.join(labels_dir, os.path.splitext(rel)[0] + ".txt")
-        ) if labels_dir else []
-        n_in = len(boxes)
-        boxes = [(args.class_map[c], *xywh) for c, *xywh in boxes if c in args.class_map]
-        boxes_filtered += n_in - len(boxes)
-        boxes, nd = clean_boxes(boxes, args.min_box_frac, args.drop_tiny_boxes)
+        boxes, nf, nd = cleaned_label(r, labels_dir, args)
+        boxes_filtered += nf
         boxes_dropped += nd
         boxes_written += len(boxes)
         negatives += not boxes
 
         lp = os.path.join(lab_dir, os.path.splitext(rel)[0] + ".txt")
         os.makedirs(os.path.dirname(lp), exist_ok=True)
-        with open(lp, "w", newline="\n") as f:
-            for c, x, y, w, h in boxes:
-                f.write(f"{c} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n")
+        write_yolo_txt(lp, boxes)
 
         W, H = int(r["width"]), int(r["height"])
         coco_images.append({"id": img_id, "file_name": os.path.basename(rel),
@@ -761,6 +779,94 @@ def write_clean_dataset(rows, labels_dir, meta, class_names, args):
                 f.write(f"  {i}: {n}\n")
 
     return kept, dropped, link_kinds, boxes_written, boxes_dropped, boxes_filtered, negatives
+
+
+def parse_hituav_name(name):
+    """HIT-UAV filenames are <time_of_day>_<altitude_m>_<camera_angle_deg>_
+    <weather>_<index>.jpg; returns {} for anything else."""
+    parts = os.path.splitext(name)[0].split("_")
+    if len(parts) != 5 or not all(p.isdigit() for p in parts):
+        return {}
+    return dict(zip(("time_of_day", "altitude_m", "camera_angle_deg", "weather"),
+                    map(int, parts[:4])))
+
+
+def write_hituav_dataset(rows, labels_dir, class_names, args):
+    """The team's clean_HITUAV layout: flat images/ + labels/ renamed
+    HU00001.. (train, then val, then test, by original name), per-image
+    metadata.json, splits/*.txt, dataset.yaml, dropped.csv, clean_report.txt."""
+    out = args.clean_out
+    check_out_dir(args)
+    for d in ("images", "labels", "splits"):
+        os.makedirs(os.path.join(out, d), exist_ok=True)
+    order = {"train": 0, "val": 1, "test": 2}
+    kept = sorted((r for r in rows if r["keep"]),
+                  key=lambda r: (order.get(r["split"], 3), os.path.basename(r["rel_path"])))
+    if any(not r["split"] for r in kept):
+        sys.exit("--layout hituav needs splits: images/{train,val,test}/ or --splits")
+
+    meta, lists = {}, defaultdict(list)
+    n_boxes = n_filtered = 0
+    for i, r in enumerate(kept, 1):
+        stem = f"{args.prefix}{i:05d}"
+        name = stem + os.path.splitext(r["rel_path"])[1].lower()
+        dst = os.path.join(out, "images", name)
+        materialize(r["path"], dst, args.link)
+        boxes, nf, _ = cleaned_label(r, labels_dir, args)
+        n_boxes += len(boxes)
+        n_filtered += nf
+        write_yolo_txt(os.path.join(out, "labels", stem + ".txt"), boxes)
+        orig = os.path.basename(r["rel_path"])
+        meta[name] = {"original_filename": orig, **parse_hituav_name(orig),
+                      "split": r["split"], "is_background": not boxes}
+        # absolute: Ultralytics resolves "./x" in a list file against the
+        # list's own folder (splits/), so the old ./images/.. lines broke
+        lists[r["split"]].append(os.path.abspath(dst).replace(os.sep, "/"))
+
+    with open(os.path.join(out, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=4)
+    for split, paths in lists.items():
+        with open(os.path.join(out, "splits", f"{split}.txt"), "w", newline="\n") as f:
+            f.write("\n".join(paths) + "\n")
+    with open(os.path.join(out, "dataset.yaml"), "w", newline="\n") as f:
+        f.write(f"path: {os.path.abspath(out)}\n")
+        for split in sorted(lists, key=order.get):
+            f.write(f"{split}: splits/{split}.txt\n")
+        f.write("\nnames:\n" + "".join(f"  {i}: {n}\n" for i, n in enumerate(class_names)))
+
+    dropped = [r for r in rows if not r["keep"]]
+    with open(os.path.join(out, "dropped.csv"), "w", newline="") as f:
+        wri = csv.writer(f)
+        wri.writerow(["Original_Filename", "Split", "Reason"])
+        for r in sorted(dropped, key=lambda r: (order.get(r["split"], 3), r["rel_path"])):
+            wri.writerow([os.path.basename(r["rel_path"]), r["split"],
+                          f'Dropped: {r["drop_reason"]}'])
+
+    # other-class boxes across the whole source, not just the kept frames
+    n_filtered += sum(cleaned_label(r, labels_dir, args)[1]
+                      for r in dropped if r["status"] == "ok")
+    reasons = Counter(r["drop_reason"].split("(")[0].split(":")[0] for r in dropped)
+    sizes = Counter(r["split"] for r in kept)
+    bar = "=" * 52
+    lines = [bar, "      HIT-UAV DATASET PREPROCESSING REPORT",
+             f"      Generated: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M:%S}",
+             bar, "", "OVERVIEW",
+             f"Total Original Images Processed: {len(rows)}",
+             f"Total Images Retained:           {len(kept)}",
+             f"Retention Rate:                  {100 * len(kept) / max(1, len(rows)):.2f}%",
+             "", "ANNOTATION METRICS",
+             f"Target {'/'.join(map(repr, class_names))} Bounding Boxes Kept:  {n_boxes}",
+             f"Other-Class Annotations Dropped: {n_filtered}",
+             "", "DROPPED IMAGES"]
+    lines += [f"{k:<32} {v}" for k, v in reasons.most_common()] or ["none"]
+    lines += ["", "SPLIT DISTRIBUTION",
+              f"Training Set:   {sizes['train']} images",
+              f"Validation Set: {sizes['val']} images",
+              f"Test Set:       {sizes['test']} images"]
+    report = "\n".join(lines)
+    with open(os.path.join(out, "clean_report.txt"), "w") as f:
+        f.write(report + "\n")
+    return report
 
 
 def write_clean_report(path, rows, kept, dropped, link_kinds, boxes_written,
@@ -937,6 +1043,11 @@ def main():
     ap.add_argument("--keep-classes", default="",
                     help='e.g. "person" -- cleaned copy keeps only these classes, '
                          "renumbered from 0; other boxes are removed")
+    ap.add_argument("--drop-negatives", action="store_true",
+                    help="drop images with no box of a kept class (background)")
+    ap.add_argument("--layout", choices=("default", "hituav"), default="default",
+                    help="hituav: the team's clean_HITUAV folder structure")
+    ap.add_argument("--prefix", default="HU", help="renamed file prefix (--layout hituav)")
     ap.add_argument("--drop-tiny-boxes", action="store_true",
                     help="remove boxes below --min-box-frac instead of flagging")
     ap.add_argument("--splits", default="",
@@ -1025,7 +1136,10 @@ def main():
                              for r in dropped).most_common():
         print(f"  {reason:<28} {n:>6}")
 
-    if args.clean_out:
+    if args.clean_out and args.layout == "hituav":
+        report = write_hituav_dataset(rows, args.labels, out_names, args)
+        print(f"\n{report}\nclean dataset -> {args.clean_out}")
+    elif args.clean_out:
         kept, dropped, kinds, bw, bd, bf, neg = write_clean_dataset(
             rows, args.labels, meta, out_names, args)
         report = write_clean_report(

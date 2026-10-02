@@ -30,6 +30,23 @@ python validate_dataset.py --images hit-uav/images --labels hit-uav/labels \
 ```
 `--keep-classes person` keeps only Person boxes (renumbered to class 0) in the cleaned copy; images with no people stay as negative samples. Validation still checks every class in the source.
 
+To produce the team's `clean_HITUAV` structure (persons only, no background images):
+```bash
+python validate_dataset.py --images hit-uav/images --labels hit-uav/labels \
+    --out hit_manifest.csv --clean-out clean_HITUAV \
+    --keep-classes person --drop-negatives --layout hituav
+```
+```
+clean_HITUAV/
+  images/HU00001.jpg ...   renamed: train, then val, then test, by original name
+  labels/HU00001.txt ...
+  splits/{train,val,test}.txt
+  metadata.json            per image: original_filename, time_of_day, altitude_m,
+                           camera_angle_deg, weather, split, is_background
+  dataset.yaml  dropped.csv  clean_report.txt
+```
+Split lists hold absolute paths (Ultralytics resolves `./` against the list file's folder), so re-run if you move the folder.
+
 **Training / testing** — the `--clean-out` dir is a ready Ultralytics dataset:
 ```bash
 yolo detect train data=clean_hit/dataset.yaml model=yolov8n.pt
