@@ -211,21 +211,40 @@ def choose_keepers(rows, sha_groups, clusters, labels_dir, args):
     return conflicts
 
 
+def quality_bins(rows, keys, n):
+    """Quantile-bin each metric over the kept frames into n bins and tag each
+    row with its stratum, e.g. "0-2" = lowest laplacian_var bin, highest std
+    bin. Quantiles are per dataset, so each source is binned on its own scale."""
+    kept = [r for r in rows if r["keep"]]
+    cols = []
+    for k in keys:
+        v = np.array([float(r[k]) for r in kept])
+        edges = np.quantile(v, np.linspace(0, 1, n + 1)[1:-1])
+        cols.append(np.searchsorted(edges, v, side="right"))
+    for r, *b in zip(kept, *cols):
+        r["quality_bin"] = "-".join(map(str, b))
+
+
 def assign_splits(rows, fractions, seed):
     """Group-aware: a near-duplicate cluster lands wholly in one split, so
-    near-identical frames cannot straddle train and test."""
+    near-identical frames cannot straddle train and test. Stratified: groups
+    are walked bin by bin and each goes to the split furthest behind its
+    running quota, so every quality_bin is spread across splits in proportion."""
     kept = [r for r in rows if r["keep"]]
     groups = defaultdict(list)
     for r in kept:
         groups[r["group_id"] or r["rel_path"]].append(r)
     names = ["train", "val", "test"][:len(fractions)]
-    targets = [f * len(kept) for f in fractions]
     counts = [0] * len(names)
     keys = sorted(groups, key=str)
     random.Random(seed).shuffle(keys)
-    # largest groups first so they cannot overshoot a small split at the end
-    for key in sorted(keys, key=lambda k: -len(groups[k])):
-        i = max(range(len(names)), key=lambda j: targets[j] - counts[j])
+    # ponytail: a group is binned by its first frame; fine while groups are small
+    # within a bin, largest groups first so later small ones can even out the quota
+    keys.sort(key=lambda k: (groups[k][0]["quality_bin"], -len(groups[k])))
+    seen = 0
+    for key in keys:
+        seen += len(groups[key])
+        i = max(range(len(names)), key=lambda j: fractions[j] * seen - counts[j])
         for r in groups[key]:
             r["split"] = names[i]
         counts[i] += len(groups[key])

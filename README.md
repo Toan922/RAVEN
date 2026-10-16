@@ -23,6 +23,8 @@ python validate_dataset.py --images <dataset>/images --labels <dataset>/labels \
 
 If images sit in `images/train`, `images/val`, `images/test` (e.g. HIT-UAV), that split is kept; `--splits` replaces it with a fresh group-aware one.
 
+Add `--stratify laplacian_var,std --bins 3` to quantile-bin those quality metrics (per dataset) and spread every bin across train/val/test in proportion; each frame's bin is written as `quality_bin` (manifest and `--layout hituav` metadata). Fewer metrics × bins keeps bins large enough to split evenly.
+
 **HIT-UAV**
 ```bash
 python validate_dataset.py --images hit-uav/images --labels hit-uav/labels \

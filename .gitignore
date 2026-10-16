@@ -11,3 +11,8 @@ quality_examples.zip
 .venv/
 __pycache__/
 .claude/
+
+# model weights: stock downloads and last-epoch checkpoints
+/*.pt
+weights/
+last.pt

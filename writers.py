@@ -22,7 +22,7 @@ FIELDS = [
     "session", "location", "weather", "surface", "season",
     "coco_status", "coco_note", "sha_group", "group_id", "group_size",
     # stage 3 -- cleaning decision
-    "keep", "drop_reason", "split",
+    "keep", "drop_reason", "quality_bin", "split",
 ]
 
 
@@ -196,9 +196,14 @@ def write_hituav_dataset(rows, labels_dir, class_names, args):
         n_filtered += nf
         write_yolo_txt(os.path.join(out, "labels", stem + ".txt"), boxes)
         orig = os.path.basename(r["rel_path"])
-        meta[name] = {"original_filename": orig, **parse_hituav_name(orig),
+        # shared core keys first, then whatever the source knows about the frame:
+        # AIResQ session attrs (joined in enrich_rows) or HIT-UAV filename fields
+        session = {k: r[k] for k in ("session", "location", "weather", "surface", "season")
+                   if r.get(k)}
+        meta[name] = {"original_filename": orig, "source": args.prefix,
                       "split": r["split"], "is_background": not boxes,
-                      **quality_of(r)}
+                      **session, **parse_hituav_name(orig), **quality_of(r),
+                      "quality_bin": r["quality_bin"]}
         # absolute: Ultralytics resolves "./x" in a list file against the
         # list's own folder (splits/), so the old ./images/.. lines broke
         lists[r["split"]].append(os.path.abspath(dst).replace(os.sep, "/"))
@@ -228,7 +233,8 @@ def write_hituav_dataset(rows, labels_dir, class_names, args):
     reasons = Counter(r["drop_reason"].split("(")[0].split(":")[0] for r in dropped)
     sizes = Counter(r["split"] for r in kept)
     bar = "=" * 52
-    lines = [bar, "      HIT-UAV DATASET PREPROCESSING REPORT",
+    title = os.path.basename(os.path.normpath(out)).upper()
+    lines = [bar, f"      {title} DATASET PREPROCESSING REPORT",
              f"      Generated: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M:%S}",
              bar, "", "OVERVIEW",
              f"Total Original Images Processed: {len(rows)}",

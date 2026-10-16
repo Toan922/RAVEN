@@ -43,8 +43,8 @@ from PIL import Image, ImageFile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from curate import (assign_splits, build_groups, choose_keepers, enrich_rows,
-                    near_duplicate_pairs)
-from image_stats import (classify_ir, dhash64, quality_metrics, sha256_and_head,
+                    near_duplicate_pairs, quality_bins)
+from image_stats import (QUALITY_KEYS, classify_ir, dhash64, quality_metrics, sha256_and_head,
                          to_uint8_gray)
 from labels import (load_coco, load_session_metadata, load_yolo_names,
                     parse_yolo_label)
@@ -256,6 +256,10 @@ def main():
     ap.add_argument("--splits", default="",
                     help='e.g. "0.8,0.1,0.1" -- group-aware train/val/test lists')
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--stratify", default="",
+                    help='e.g. "laplacian_var,std" -- quantile-bin these quality '
+                         "metrics and spread every bin evenly across --splits")
+    ap.add_argument("--bins", type=int, default=3, help="quantile bins per --stratify metric")
     args = ap.parse_args()
 
     parent = os.path.dirname(os.path.abspath(args.images))
@@ -287,6 +291,9 @@ def main():
           f"classes={args.classes} {class_names}")
 
     fractions = [float(x) for x in args.splits.split(",")] if args.splits else []
+    strat = [k.strip() for k in args.stratify.split(",") if k.strip()]
+    if set(strat) - set(QUALITY_KEYS):
+        sys.exit(f"--stratify {sorted(set(strat) - set(QUALITY_KEYS))} not in {QUALITY_KEYS}")
     if fractions and abs(sum(fractions) - 1.0) > 1e-6:
         sys.exit(f"--splits must sum to 1.0, got {sum(fractions)}")
 
@@ -321,6 +328,8 @@ def main():
         if args.near_dup_hamming > 0 else []
     sha_groups, clusters = build_groups(rows, pairs)
     conflicts = choose_keepers(rows, sha_groups, clusters, args.labels, args)
+    if strat:
+        quality_bins(rows, strat, args.bins)
     split_counts = assign_splits(rows, fractions, args.seed) if fractions else \
         dict(Counter(r["split"] for r in rows if r["keep"] and r["split"]))
 
