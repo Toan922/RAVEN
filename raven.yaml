@@ -1,0 +1,9 @@
+# AIResQ + HIT-UAV, person only. Built from the two --layout hituav outputs;
+# check with: python check_unified.py raven.yaml
+path: /mnt/c/Users/toan9/Documents/RAVEN
+train: [clean_AIResQ/splits/train.txt, clean_HITUAV/splits/train.txt]
+val: [clean_AIResQ/splits/val.txt, clean_HITUAV/splits/val.txt]
+test: [clean_AIResQ/splits/test.txt, clean_HITUAV/splits/test.txt]
+
+names:
+  0: Person
