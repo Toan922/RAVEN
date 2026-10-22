@@ -42,6 +42,7 @@ from PIL import Image, ImageFile
 # via sys.path[0], which Windows leaves empty for forward-slash script paths).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from check_unified import CrossDatasetValidator
 from curate import (assign_splits, build_groups, choose_keepers, enrich_rows,
                     near_duplicate_pairs, quality_bins)
 from image_stats import (QUALITY_KEYS, classify_ir, dhash64, quality_metrics, sha256_and_head,
@@ -60,7 +61,8 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 
 def inspect(job):
-    path, root, labels_dir, n_classes, min_box_frac = job
+    path, root, labels_dir, n_classes, min_box_frac, *rest = job
+    drop_tiny = rest[0] if rest else False
     rel = os.path.relpath(path, root)
     row = {k: "" for k in FIELDS}
     row["path"] = path
@@ -121,7 +123,7 @@ def inspect(job):
 
     if labels_dir:
         lp = os.path.join(labels_dir, os.path.splitext(rel)[0] + ".txt")
-        st, n, errs, cls = parse_yolo_label(lp, n_classes, min_box_frac)
+        st, n, errs, cls = parse_yolo_label(lp, n_classes, min_box_frac, drop_tiny=drop_tiny)
         row["label_status"], row["n_boxes"] = st, n
         row["label_errors"], row["class_ids"] = errs, cls
     return row
@@ -202,7 +204,7 @@ def summarize(rows, pairs, out_prefix, blur_pct):
                or r["label_status"] in ("missing", "invalid")]
     path = f"{out_prefix}_flagged.csv"
     with open(path, "w", newline="") as f:
-        wri = csv.DictWriter(f, fieldnames=FIELDS)
+        wri = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         wri.writeheader()
         wri.writerows(flagged)
     print(f"\n{len(flagged)} files need a human look -> {path}")
@@ -248,6 +250,8 @@ def main():
                          "renumbered from 0; other boxes are removed")
     ap.add_argument("--drop-negatives", action="store_true",
                     help="drop images with no box of a kept class (background)")
+    ap.add_argument("--max-bg-ratio", type=float, default=None,
+                    help="cap empty background frames at this ratio of positive target frames")
     ap.add_argument("--layout", choices=("default", "hituav"), default="default",
                     help="hituav: the team's clean_HITUAV folder structure")
     ap.add_argument("--prefix", default="HU", help="renamed file prefix (--layout hituav)")
@@ -307,7 +311,7 @@ def main():
         sys.exit(f"no images found under {args.images}")
     print(f"scanning {len(files)} files with {args.workers} workers...")
 
-    jobs = [(p, args.images, args.labels, args.classes, args.min_box_frac)
+    jobs = [(p, args.images, args.labels, args.classes, args.min_box_frac, args.drop_tiny_boxes)
             for p in files]
     rows = []
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
@@ -330,16 +334,29 @@ def main():
     conflicts = choose_keepers(rows, sha_groups, clusters, args.labels, args)
     if strat:
         quality_bins(rows, strat, args.bins)
-    split_counts = assign_splits(rows, fractions, args.seed) if fractions else \
-        dict(Counter(r["split"] for r in rows if r["keep"] and r["split"]))
+    split_counts = assign_splits(rows, fractions, args.seed, class_map=args.class_map) \
+        if fractions else dict(Counter(r["split"] for r in rows if r["keep"] and r["split"]))
+
+    # Run the 4-stage Cross-Dataset Integrity Check over the curated manifest
+    eff_bg_ratio = 0.0 if args.drop_negatives else args.max_bg_ratio
+    validator = CrossDatasetValidator(
+        n_classes=args.classes,
+        min_box_frac=args.min_box_frac,
+        max_bg_ratio=eff_bg_ratio,
+    )
+    integrity_report = validator.validate_curation(
+        rows, labels_dir=args.labels, meta=meta, coco=coco,
+        coco_path=args.coco, class_map=args.class_map
+    )
 
     with open(args.out, "w", newline="") as f:
-        wri = csv.DictWriter(f, fieldnames=FIELDS)
+        wri = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         wri.writeheader()
         wri.writerows(rows)
     print(f"manifest -> {args.out}")
 
     summarize(rows, pairs, os.path.splitext(args.out)[0], args.blur_pct)
+    print(f"\n{integrity_report.summary()}")
 
     dropped = [r for r in rows if not r["keep"]]
     print(f"\ncleaning decision: keep {len(rows) - len(dropped)}, "

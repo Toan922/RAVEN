@@ -5,10 +5,22 @@ import json
 import os
 
 
-def parse_yolo_label(label_path, n_classes, min_box_frac):
+def parse_hituav_name(name):
+    """HIT-UAV filenames are <time_of_day>_<altitude_m>_<camera_angle_deg>_
+    <weather>_<index>.jpg; returns {} for anything else."""
+    parts = os.path.splitext(name)[0].split("_")
+    if len(parts) != 5 or not all(p.isdigit() for p in parts):
+        return {}
+    # Extract integer flight telemetry fields from the 5-part filename stem
+    return dict(zip(("time_of_day", "altitude_m", "camera_angle_deg", "weather"),
+                    map(int, parts[:4])))
+
+
+def parse_yolo_label(label_path, n_classes, min_box_frac, drop_tiny=False):
     if not os.path.exists(label_path):
         return "missing", 0, "no label file", ""
-    errs, boxes, cls = [], [], []
+    # Separate audit flags (errs) from fatal label defects (hard_errs)
+    errs, hard_errs, boxes, cls = [], [], [], []
     with open(label_path, "r", errors="replace") as f:
         for i, line in enumerate(f, 1):
             line = line.strip()
@@ -16,35 +28,61 @@ def parse_yolo_label(label_path, n_classes, min_box_frac):
                 continue
             parts = line.split()
             if len(parts) < 5:
-                errs.append(f"L{i}:fields={len(parts)}")
+                msg = f"L{i}:fields={len(parts)}"
+                errs.append(msg)
+                hard_errs.append(msg)
                 continue
             try:
                 c = int(float(parts[0]))
                 x, y, w, h = (float(v) for v in parts[1:5])
             except ValueError:
-                errs.append(f"L{i}:unparseable")
+                msg = f"L{i}:unparseable"
+                errs.append(msg)
+                hard_errs.append(msg)
                 continue
+            # Validate class ID falls within [0, n_classes)
             if not (0 <= c < n_classes):
-                errs.append(f"L{i}:class={c}")
+                msg = f"L{i}:class={c}"
+                errs.append(msg)
+                hard_errs.append(msg)
+            # Filter out zero-area / degenerate boxes
             if w <= 0 or h <= 0:
-                errs.append(f"L{i}:degenerate")
+                msg = f"L{i}:degenerate"
+                errs.append(msg)
+                if not drop_tiny:
+                    hard_errs.append(msg)
                 continue
+            # Ensure center and dimensions fall within normalized [0.0, 1.0] range
             if not all(0.0 <= v <= 1.0 for v in (x, y, w, h)):
-                errs.append(f"L{i}:not-normalized")
+                msg = f"L{i}:not-normalized"
+                errs.append(msg)
+                hard_errs.append(msg)
+            # Ensure box corners do not extend outside the image frame
             if x - w / 2 < -1e-3 or x + w / 2 > 1 + 1e-3 or \
                y - h / 2 < -1e-3 or y + h / 2 > 1 + 1e-3:
-                errs.append(f"L{i}:out-of-frame")
+                msg = f"L{i}:out-of-frame"
+                errs.append(msg)
+                hard_errs.append(msg)
+            # Flag and optionally filter out microscopic box artifacts
             if w * h < min_box_frac:
-                errs.append(f"L{i}:tiny({w*h:.2e})")
+                msg = f"L{i}:tiny({w*h:.2e})"
+                errs.append(msg)
+                if drop_tiny:
+                    continue
+                hard_errs.append(msg)
             boxes.append((c, round(x, 5), round(y, 5), round(w, 5), round(h, 5)))
             cls.append(c)
+    # Flag duplicate bounding boxes within the same frame
     dupes = len(boxes) - len(set(boxes))
     if dupes:
-        errs.append(f"duplicate-boxes={dupes}")
-    if not boxes and not errs:
-        status = "empty"          # legitimate negative sample, but count it
-    elif errs:
+        msg = f"duplicate-boxes={dupes}"
+        errs.append(msg)
+        if not drop_tiny:
+            hard_errs.append(msg)
+    if hard_errs:
         status = "invalid"
+    elif not boxes:
+        status = "empty"          # legitimate negative sample, but count it
     else:
         status = "ok"
     return status, len(boxes), ";".join(errs[:8]), ",".join(map(str, sorted(set(cls))))
@@ -80,14 +118,17 @@ def clean_boxes(boxes, min_box_frac, drop_tiny):
     """Clamp to the frame, drop degenerate//tiny boxes, de-duplicate, sort."""
     out, dropped = [], 0
     for c, x, y, w, h in boxes:
+        # Clamp box corners to [0.0, 1.0]
         x0, y0 = max(0.0, x - w / 2), max(0.0, y - h / 2)
         x1, y1 = min(1.0, x + w / 2), min(1.0, y + h / 2)
         nw, nh = x1 - x0, y1 - y0
+        # Filter out zero-area boxes and (when enabled) microscopic artifacts
         if nw <= 0 or nh <= 0 or (drop_tiny and nw * nh < min_box_frac):
             dropped += 1
             continue
         out.append((c, round(x0 + nw / 2, 6), round(y0 + nh / 2, 6),
                     round(nw, 6), round(nh, 6)))
+    # De-duplicate identical boxes in the same frame
     deduped = sorted(set(out))
     dropped += len(out) - len(deduped)
     return deduped, dropped

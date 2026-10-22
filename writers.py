@@ -9,7 +9,7 @@ import sys
 from collections import Counter, defaultdict
 
 from image_stats import quality_of
-from labels import clean_boxes, read_yolo_boxes, write_yolo_txt
+from labels import clean_boxes, parse_hituav_name, read_yolo_boxes, write_yolo_txt
 
 FIELDS = [
     "path", "rel_path", "bytes", "sha256", "status", "error",
@@ -18,8 +18,8 @@ FIELDS = [
     "unique_colors", "gray_frac", "mean", "std", "clipped_low_frac",
     "clipped_high_frac", "entropy", "laplacian_var", "dhash",
     "label_status", "n_boxes", "label_errors", "class_ids",
-    # stage 2 -- AIResQ sidecar join, COCO cross-check, duplicate grouping
-    "session", "location", "weather", "surface", "season",
+    # stage 2 -- AIResQ sidecar join, telemetry check, COCO cross-check, duplicate grouping
+    "session", "location", "weather", "surface", "season", "telemetry_status",
     "coco_status", "coco_note", "sha_group", "group_id", "group_size",
     # stage 3 -- cleaning decision
     "keep", "drop_reason", "quality_bin", "split",
@@ -128,12 +128,12 @@ def write_clean_dataset(rows, labels_dir, meta, class_names, args):
             json.dump(dict(sorted(sessions.items())), f, indent=1)
 
     with open(os.path.join(out, "manifest.csv"), "w", newline="") as f:
-        wri = csv.DictWriter(f, fieldnames=FIELDS)
+        wri = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         wri.writeheader()
         wri.writerows(rows)
     dropped = [r for r in rows if not r["keep"]]
     with open(os.path.join(out, "dropped.csv"), "w", newline="") as f:
-        wri = csv.DictWriter(f, fieldnames=FIELDS)
+        wri = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         wri.writeheader()
         wri.writerows(dropped)
 
@@ -158,16 +158,6 @@ def write_clean_dataset(rows, labels_dir, meta, class_names, args):
                 f.write(f"  {i}: {n}\n")
 
     return kept, dropped, link_kinds, boxes_written, boxes_dropped, boxes_filtered, negatives
-
-
-def parse_hituav_name(name):
-    """HIT-UAV filenames are <time_of_day>_<altitude_m>_<camera_angle_deg>_
-    <weather>_<index>.jpg; returns {} for anything else."""
-    parts = os.path.splitext(name)[0].split("_")
-    if len(parts) != 5 or not all(p.isdigit() for p in parts):
-        return {}
-    return dict(zip(("time_of_day", "altitude_m", "camera_angle_deg", "weather"),
-                    map(int, parts[:4])))
 
 
 def write_hituav_dataset(rows, labels_dir, class_names, args):
