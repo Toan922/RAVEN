@@ -11,8 +11,11 @@ quality_examples.zip
 .venv/
 __pycache__/
 .claude/
+.env
 
 # model weights: stock downloads and last-epoch checkpoints
 /*.pt
 /weights/
 last.pt
+*.log
+discord_bot/mock_detection.jpg
