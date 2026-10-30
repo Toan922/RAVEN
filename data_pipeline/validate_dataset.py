@@ -17,12 +17,12 @@ the filesystem allows and copied otherwise.
 
 Usage:
     # validate only
-    python validate_dataset.py --images AIResQ/images --labels AIResQ/labels \
-        --out manifest.csv
+    python data_pipeline/validate_dataset.py --images AIResQ/images --labels AIResQ/labels \
+        --out manifests/manifest.csv
 
     # validate + emit a cleaned dataset
-    python validate_dataset.py --images AIResQ/images --labels AIResQ/labels \
-        --out manifest.csv --clean-out clean_AIResQ
+    python data_pipeline/validate_dataset.py --images AIResQ/images --labels AIResQ/labels \
+        --out manifests/manifest.csv --clean-out clean_AIResQ
 
 Deps: pillow, numpy
 """
@@ -225,7 +225,7 @@ def main():
     ap.add_argument("--labels", default=None, help="YOLO .txt label dir (optional)")
     ap.add_argument("--classes", type=int, default=None,
                     help="default: derived from dataset.yaml or labels.json, else 2")
-    ap.add_argument("--out", default="manifest.csv")
+    ap.add_argument("--out", default="manifests/manifest.csv")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1))
     ap.add_argument("--near-dup-hamming", type=int, default=4,
                     help="0 disables near-duplicate search")
@@ -349,6 +349,7 @@ def main():
         coco_path=args.coco, class_map=args.class_map
     )
 
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", newline="") as f:
         wri = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         wri.writeheader()

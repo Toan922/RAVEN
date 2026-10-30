@@ -1,4 +1,4 @@
-"""python test_curate.py -- stratified, group-aware split & CrossDatasetValidator tests."""
+"""python data_pipeline/test_curate.py -- stratified, group-aware split & CrossDatasetValidator tests."""
 import json
 import os
 import random

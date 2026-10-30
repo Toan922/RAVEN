@@ -1,7 +1,7 @@
 """Cross-Dataset Integrity Check for the RAVEN SAR data pipeline.
 
-    python check_unified.py raven.yaml
-    python check_unified.py raven.yaml --max-bg-ratio 0.25 --check-hashes
+    python data_pipeline/check_unified.py raven.yaml
+    python data_pipeline/check_unified.py raven.yaml --max-bg-ratio 0.25 --check-hashes
 """
 
 import argparse
@@ -16,6 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from curate import is_positive_row
 from image_stats import QUALITY_KEYS, sha256_and_head
 from labels import clean_boxes, load_yolo_names, parse_hituav_name
+
+# raven.yaml lives at the repo root, one level above this folder
+DEFAULT_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raven.yaml")
 
 # Shared core + quality fields required on every frame in metadata.json
 CORE_SCHEMA = {
@@ -624,7 +627,7 @@ class CrossDatasetValidator:
         return rep
 
 
-def main(yaml_path="raven.yaml", max_bg_ratio=0.0, min_box_frac=2e-6, check_hashes=False):
+def main(yaml_path=DEFAULT_YAML, max_bg_ratio=0.0, min_box_frac=2e-6, check_hashes=False):
     validator = CrossDatasetValidator(
         n_classes=1, min_box_frac=min_box_frac, max_bg_ratio=max_bg_ratio, require_telemetry=True,
     )
@@ -639,7 +642,7 @@ def main(yaml_path="raven.yaml", max_bg_ratio=0.0, min_box_frac=2e-6, check_hash
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Run the Cross-Dataset Integrity Check over a merged YOLO yaml.")
-    ap.add_argument("yaml", nargs="?", default="raven.yaml", help="path to merged YOLO yaml (default: raven.yaml)")
+    ap.add_argument("yaml", nargs="?", default=DEFAULT_YAML, help="path to merged YOLO yaml (default: raven.yaml)")
     ap.add_argument("--max-bg-ratio", type=float, default=0.0, help="max allowed background-to-positive ratio")
     ap.add_argument("--min-box-frac", type=float, default=2e-6, help="min normalized box area before microscopic flag")
     ap.add_argument("--check-hashes", action="store_true", help="hash image files to check cross-split SHA-256 leakage")
