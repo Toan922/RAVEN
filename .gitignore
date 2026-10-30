@@ -19,3 +19,6 @@ __pycache__/
 last.pt
 *.log
 discord_bot/mock_detection.jpg
+
+# generated demo videos (rebuild with: python videos/splice_video.py)
+*.mp4
