@@ -22,3 +22,6 @@ discord_bot/mock_detection.jpg
 
 # generated demo videos (rebuild with: python videos/splice_video.py)
 *.mp4
+
+# frames saved by backend/ingest.py (rebuild by re-running it)
+runs/ingest/
