@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from labels import label_text, parse_hituav_name, read_yolo_boxes
+from raven.data_pipeline.labels import label_text, parse_hituav_name, read_yolo_boxes
 
 # Boxes are compared against COCO after a round-trip through 6-decimal
 # normalised YOLO text, so ~5e-7 of drift is expected; 1e-3 (2 px at 2048)

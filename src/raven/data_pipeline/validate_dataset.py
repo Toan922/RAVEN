@@ -17,11 +17,11 @@ the filesystem allows and copied otherwise.
 
 Usage:
     # validate only
-    python data_pipeline/validate_dataset.py --images AIResQ/images --labels AIResQ/labels \
+    python -m raven.data_pipeline.validate_dataset --images AIResQ/images --labels AIResQ/labels \
         --out manifests/manifest.csv
 
     # validate + emit a cleaned dataset
-    python data_pipeline/validate_dataset.py --images AIResQ/images --labels AIResQ/labels \
+    python -m raven.data_pipeline.validate_dataset --images AIResQ/images --labels AIResQ/labels \
         --out manifests/manifest.csv --clean-out clean_AIResQ
 
 Deps: pillow, numpy
@@ -38,18 +38,14 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 from PIL import Image, ImageFile
 
-# Sibling modules resolve relative to this file, not the caller's cwd (and not
-# via sys.path[0], which Windows leaves empty for forward-slash script paths).
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from check_unified import CrossDatasetValidator
-from curate import (assign_splits, build_groups, choose_keepers, enrich_rows,
+from raven.data_pipeline.check_unified import CrossDatasetValidator
+from raven.data_pipeline.curate import (assign_splits, build_groups, choose_keepers, enrich_rows,
                     near_duplicate_pairs, quality_bins)
-from image_stats import (QUALITY_KEYS, classify_ir, dhash64, quality_metrics, sha256_and_head,
+from raven.data_pipeline.image_stats import (QUALITY_KEYS, classify_ir, dhash64, quality_metrics, sha256_and_head,
                          to_uint8_gray)
-from labels import (load_coco, load_session_metadata, load_yolo_names,
+from raven.data_pipeline.labels import (load_coco, load_session_metadata, load_yolo_names,
                     parse_yolo_label)
-from writers import (FIELDS, write_clean_dataset, write_clean_report,
+from raven.data_pipeline.writers import (FIELDS, write_clean_dataset, write_clean_report,
                      write_hituav_dataset)
 
 # Fail loudly on truncated files instead of silently padding them with grey.

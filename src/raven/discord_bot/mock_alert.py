@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # get the root directory of the project
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parents[3]
 
 # join the root directory with the path to the image
 HIT_UAV_IMAGE_PATH = ROOT_DIR / "clean_HITUAV/splits/test.txt"

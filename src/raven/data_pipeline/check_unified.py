@@ -1,24 +1,21 @@
 """Cross-Dataset Integrity Check for the RAVEN SAR data pipeline.
 
-    python data_pipeline/check_unified.py raven.yaml
-    python data_pipeline/check_unified.py raven.yaml --max-bg-ratio 0.25 --check-hashes
+    python -m raven.data_pipeline.check_unified raven.yaml
+    python -m raven.data_pipeline.check_unified raven.yaml --max-bg-ratio 0.25 --check-hashes
 """
 
 import argparse
 import json
 import math
 import os
-import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from raven.data_pipeline.curate import is_positive_row
+from raven.data_pipeline.image_stats import QUALITY_KEYS, sha256_and_head
+from raven.data_pipeline.labels import clean_boxes, load_yolo_names, parse_hituav_name
 
-from curate import is_positive_row
-from image_stats import QUALITY_KEYS, sha256_and_head
-from labels import clean_boxes, load_yolo_names, parse_hituav_name
-
-# raven.yaml lives at the repo root, one level above this folder
-DEFAULT_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raven.yaml")
+# raven.yaml lives at the repo root, three levels above this folder (src/raven/data_pipeline)
+DEFAULT_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "raven.yaml")
 
 # Shared core + quality fields required on every frame in metadata.json
 CORE_SCHEMA = {

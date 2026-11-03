@@ -6,7 +6,7 @@ import cv2
 from pathlib import Path
 
 # define the root directory of the project
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parents[3]
 
 # define the path to the dataset directory
 DATASET_DIRS = [ROOT_DIR / "AIResQ" / "images", ROOT_DIR / "hit-uav" / "images"]

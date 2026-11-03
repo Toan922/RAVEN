@@ -8,8 +8,8 @@ import shutil
 import sys
 from collections import Counter, defaultdict
 
-from image_stats import quality_of
-from labels import clean_boxes, parse_hituav_name, read_yolo_boxes, write_yolo_txt
+from raven.data_pipeline.image_stats import quality_of
+from raven.data_pipeline.labels import clean_boxes, parse_hituav_name, read_yolo_boxes, write_yolo_txt
 
 FIELDS = [
     "path", "rel_path", "bytes", "sha256", "status", "error",

@@ -4,7 +4,7 @@ import os
 import discord
 import io
 from dotenv import load_dotenv
-from mock_alert import create_mock_alert, render_boxes
+from raven.discord_bot.mock_alert import create_mock_alert, render_boxes
 
 # setup the redis stream name
 REDIS_STREAM_NAME = "raven:detections"

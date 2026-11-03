@@ -1,13 +1,13 @@
-"""python data_pipeline/test_curate.py -- stratified, group-aware split & CrossDatasetValidator tests."""
+"""python tests/test_curate.py (or pytest) -- stratified, group-aware split & CrossDatasetValidator tests."""
 import json
 import os
 import random
 import tempfile
 from collections import Counter, defaultdict
 
-from check_unified import CrossDatasetValidator
-from curate import (assign_splits, cap_background_frames, quality_bins)
-from labels import parse_yolo_label
+from raven.data_pipeline.check_unified import CrossDatasetValidator
+from raven.data_pipeline.curate import (assign_splits, cap_background_frames, quality_bins)
+from raven.data_pipeline.labels import parse_yolo_label
 
 
 def test_stratified_group_aware_splits():
