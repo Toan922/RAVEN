@@ -1,57 +1,161 @@
-import redis
-import json
-import os
 import discord
 import io
-from dotenv import load_dotenv
-from raven.discord_bot.mock_alert import create_mock_alert, render_boxes
+import time
+import asyncio
+from PIL import Image, ImageDraw
 
-# setup the redis stream name
-REDIS_STREAM_NAME = "raven:detections"
-
-# the consumer group the Discord bot reads as, and this reader's name within it
-GROUP_NAME = "discord"
-CONSUMER_NAME = "bot-1"
-
-# minimum video time between two alerts, so one sighting doesn't flood the channel
+# FR-12: minimum seconds between two alerts, so one sighting doesn't flood the channel
 COOLDOWN_SECONDS = 10
 
-def create_group(redis_client):
+# FR-11.2: seconds to wait before trying a failed alert again
+RETRY_SECONDS = 3
+
+class DiscordSubscriber:
     """
-    Create the consumer group on the detections stream so the bot has a bookmark of which events it has handled.
-    Starts from the oldest message (id "0") and creates the stream if ingest hasn't published yet.
-    Safe to call on every startup: if the group already exists, it does nothing.
+    Alert Notification subsystem (architecture sections 2.2 and 6): subscribes to HumanDetected on the
+    Detection Event Bus and sends alerts to a Discord webhook (FR-11.1, C-03).
+    Keeps track of the Discord webhook, the time of the last alert queued, and the queue of alerts waiting to be sent.
+    Ensures that alerts are not sent too frequently by using a cooldown mechanism (FR-12).
+    Failed alerts are retried until delivered (FR-11.2, NFR-09). The queue is held in memory, so it covers
+    network and Discord outages, but alerts still waiting are lost if RAVEN itself stops.
+    """
+
+    def __init__(self, webhook):
+        self.webhook = webhook
+        self.last_alert_time = None
+        self.alerts = asyncio.Queue()
+
+    async def on_human_detected(self, event):
+        """
+        Bus handler for HumanDetected, published only for detections at or above the threshold (FR-10.1).
+        Checks the cooldown (FR-12) and adds the alert to the queue for deliver_alerts() to send. It never waits
+        on Discord, so a slow or failed upload can't hold up the event loop or the pipeline (NFR-05, architecture section 5.2).
+        """
+
+        # check if we should alert based on the cooldown (FR-12)
+        if not should_alert(event, self.last_alert_time):
+            return
+
+        # add the event to the queue, where it is retried until delivered (FR-11.2)
+        await self.alerts.put(event)
+
+        # start the cooldown when queued, not when sent, or every frame during an outage would queue another alert (FR-12)
+        self.last_alert_time = event.time
+
+    async def deliver_alerts(self):
+        """
+        Continuously deliver alerts from the queue to the Discord webhook, retrying failed sends (FR-11.1, FR-11.2, NFR-09).
+        Runs as its own asyncio task for the whole session. Sends in a separate thread so an upload never freezes the
+        event loop (NFR-03, NFR-05). Alerts are sent in order, so one that keeps failing holds up those behind it.
+        """
+        while True:
+            event = await self.alerts.get()
+
+            # keep trying to send the alert until it succeeds (NFR-09)
+            while True:
+                try:
+                    await asyncio.to_thread(
+                        send_alert,
+                        event,
+                        self.webhook
+                    )
+                    break
+                except Exception as e:
+                    print(f"Failed to send alert: {e}. Retrying in {RETRY_SECONDS} seconds...")
+                    await asyncio.sleep(RETRY_SECONDS)
+
+            # mark this alert as finished, which is what alerts.join() waits for at shutdown
+            self.alerts.task_done()
+
+
+def render_boxes(event):
+    """
+    Draw the bounding boxes on the saved frame for the given event, for the alert's frame image (FR-10.2, NFR-07).
+    Returns a PIL Image object.
+    """
+
+    # get the image from the event's saved frame and create a draw object for it
+    image = Image.open(event.frame).convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    for bounding_box in event.bounding_boxes:
+        box = bounding_box["box_xyxy"]
+        x1, y1, x2, y2 = box
+        draw.rectangle(
+            [x1, y1, x2, y2],
+            outline="red",
+            width=max(3, image.width // 400)
+        )
+
+    return image
+
+def create_discord_alert(event):
+    """
+    Create a Discord embed message for the given detection event (FR-10.2, NFR-07).
+    Coordinates are in decimal degrees (NFR-06). If the frame has no telemetry, the alert says the location is
+    not available and still sends (FR-09).
+    Not implemented yet: per-person location (FR-08) and the approximate label (FR-09), see docs/TODO.md.
+    The location shown is currently the drone's position.
+    Returns a discord.Embed object.
     """
     
-    # create the consumer group on the stream, starting from the oldest message (id "0")
-    try:
-        redis_client.xgroup_create(REDIS_STREAM_NAME, GROUP_NAME, id="0", mkstream=True)
-    except redis.exceptions.ResponseError:
-        pass
+    # create the embed message for the alert (FR-10.1)
+    embed = discord.Embed(
+        title=f"{len(event.bounding_boxes)} Human(s) Detected",
+        description=f"At Time: {time.strftime('%H:%M:%S', time.localtime(event.time))}",
+        color=discord.Color.red()
+    )
+
+    # add the location information to the embed (FR-10.2)
+    if event.telemetry:
+        latitude = event.telemetry["latitude"]
+        longitude = event.telemetry["longitude"]
+        maps_url = f"https://www.google.com/maps/search/?api=1&query={latitude},{longitude}"
+
+        embed.add_field(
+            name="Location",
+            value=f"{latitude:.5f}, {longitude:.5f} [View on Maps]({maps_url})",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="Location",
+            value="Location not available",
+            inline=False
+        )
+
+    # add the highest confidence score in the frame to the embed (FR-10.2)
+    best_confidence = max(bounding_box["confidence"] for bounding_box in event.bounding_boxes)
+    embed.add_field(
+        name="Confidence Score",
+        value=f"{best_confidence:.2f}",
+        inline=False
+    )
+
+    # attach the frame image to the embed (FR-10.2)
+    embed.set_image(url="attachment://image.png")
+
+    return embed
 
 def should_alert(event, last_alert_time):
     """
-    Decide whether this event should trigger an alert, based on the cooldown.
-    Always alerts on the first event, and when the video time goes backwards (a new video started).
+    Decide whether this event should trigger an alert, based on the cooldown (FR-12).
+    Always alerts on the first event.
     """
 
-    # no alert sent yet
+    # no alert queued yet
     if last_alert_time is None:
         return True
 
-    # time went backwards, so this is a new video and the old cooldown doesn't apply
-    if event["time"] < last_alert_time:
-        return True
-
     # alert only once the cooldown has passed since the last alert
-    return event["time"] - last_alert_time >= COOLDOWN_SECONDS
+    return event.time - last_alert_time >= COOLDOWN_SECONDS
 
 def send_alert(event, webhook):
     """
-    Turn one detection event into a Discord alert.
-    Draws the bounding boxes on the saved frame with render_boxes(), builds the embed with create_mock_alert(),
-    and sends both to the alerts channel.
-    Raises if the alert can't be sent, so listen() leaves the message unacknowledged and it can be retried.
+    Turn one detection event into a Discord alert (FR-10.2) and post it to the configured channel (FR-11.1).
+    Draws the bounding boxes on the saved frame with render_boxes(), builds the embed,
+    and sends both to the alerts channel over the HTTPS webhook (NFR-02, C-03).
+    Raise an exception if the message fails to send, so the caller can retry it (FR-11.2, NFR-09).
     """
     
     # draw the bounding boxes on the saved frame and save it to a buffer
@@ -63,59 +167,7 @@ def send_alert(event, webhook):
     file = discord.File(fp=buffer, filename="image.png")
     
     # create the embed message for the alert
-    embed = create_mock_alert(event)
+    embed = create_discord_alert(event)
     
     # send the alert to the Discord channel with the embed message and the image as an attachment
     webhook.send(embed=embed, file=file)
-
-def listen(redis_client, webhook):
-    """
-    Read new events from the stream forever as the Discord consumer group.
-    Blocks while waiting for new messages, decodes each event from JSON, sends an alert with send_alert()
-    unless the event is inside the cooldown, then acknowledges the message.
-    If send_alert() raises, the message is not acknowledged and stays pending for a retry.
-    """
-
-    # catch up on pending messages
-    last_id = "0"
-
-    # video time of the last alert sent, None until the first alert
-    last_alert_time = None
-    
-    # loop forever, reading new messages from the stream
-    while True:
-        messages = redis_client.xreadgroup(
-            GROUP_NAME, 
-            CONSUMER_NAME,
-            {REDIS_STREAM_NAME: last_id}, 
-            count=10, 
-            block=5000,
-        )
-
-        if last_id == "0" and not any(entries for _, entries in messages):
-            # no pending messages left, switch to new ones
-            last_id = ">"
-
-        for _, entries in messages:
-            for message_id, message_data in entries:
-                # decode the event from JSON
-                event = json.loads(message_data["event"])
-
-                # send an alert unless we're still inside the cooldown of the last one
-                if should_alert(event, last_alert_time):
-                    send_alert(event, webhook)
-                    last_alert_time = event["time"]
-
-                # mark the event as handled, whether it was alerted or skipped by the cooldown
-                redis_client.xack(REDIS_STREAM_NAME, GROUP_NAME, message_id)
-
-if __name__ == "__main__":
-    # connect to redis, create the consumer group, then listen for detection events
-    redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
-    create_group(redis_client)
-    
-    # load the discord webhook from the .env file
-    load_dotenv()
-    webhook = discord.SyncWebhook.from_url(os.environ["DISCORD_WEBHOOK_URL"])
-    
-    listen(redis_client, webhook)

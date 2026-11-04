@@ -9,21 +9,26 @@ receive on the bus's event loop thread. Run with:
 import asyncio
 import threading
 import time
+import os
 from pathlib import Path
 
 import cv2
+import discord
 from bubus import EventBus
+from dotenv import load_dotenv
 
 from raven.backend.detection import detect_humans, load_model
 from raven.backend.events import HumanDetected, PipelineStatus
 from raven.backend.frame_sampler import sample_frame
 from raven.backend.telemetry import TelemetryReceiver
+from raven.discord_bot.subscriber import DiscordSubscriber
 
 # temp settings until frontend is config'd after, will read from config file
 STREAM_URL = "udp://127.0.0.1:5000"
 TELEMETRY_ADDRESS = ("127.0.0.1", 5001)
 FRAMES_PER_SECOND_RATE = 1        # FR-05, allowed 1-2
 MIN_CONFIDENCE = 0.5              # FR-10.1
+SHUTDOWN_ALERT_TIMEOUT_SECONDS = 5.0  # how long shutdown waits for queued alerts to send
 
 # get the root directory of the project
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -79,29 +84,25 @@ def run_detections(worker_bus, telemetry_receiver, model, stop):
             bounding_boxes=boxes
         ))
 
-# shortcut: print subscribers so runs are visible in the terminal; replace with the Discord, Detection Log
-# and Operator Console subscribers once they're on the bus
+# shortcut: prints status to the terminal, replace with the Detection Log and Operator Console subscribers once they're on the bus
 def print_status(event):
     """Print a PipelineStatus event (feed and detection problems) to the terminal."""
     print(f"{time.strftime('%H:%M:%S')}  STATUS    {event.status} ({event.source}): {event.message}", flush=True)
 
-def print_detection(event):
-    """Print a HumanDetected event to the terminal: how many people, best confidence, location and saved frame."""
-    best = max(box["confidence"] for box in event.bounding_boxes)
-    if event.telemetry is None:
-        location = "location unavailable"
-    else:
-        location = f"drone at {event.telemetry['latitude']:.5f}, {event.telemetry['longitude']:.5f}"
-    print(f"{time.strftime('%H:%M:%S', time.localtime(event.time))}  DETECTED  "
-          f"{len(event.bounding_boxes)} person(s), best {best:.0%}, {location}, frame {event.frame}", flush=True)
-
 async def main():
     """
-    Start RAVEN: create the event bus and the ThreadSafeBus wrapper for worker threads, load and warm up the
-    model, start the telemetry receiver thread, then run run_detections in its own worker thread and wait.
+    Start RAVEN: create the event bus and the ThreadSafeBus wrapper for worker threads, register the subscribers,
+    start the Discord alert delivery task (FR-11.1, FR-11.2), load and warm up the model, start the telemetry
+    receiver thread, then run run_detections in its own worker thread and wait.
     On exit, an error, or Ctrl+C: set stop, wait for the worker to finish so its last events still reach the bus,
-    deliver any queued events, then stop the bus.
+    hand any remaining events to the subscribers, give queued alerts a limited time to send (NFR-09), report any that
+    didn't, then cancel the delivery task and stop the bus.
     """
+
+    # get the discord webhook and create the human detected subscriber
+    load_dotenv()
+    webhook = discord.SyncWebhook.from_url(os.environ["DISCORD_WEBHOOK_URL"])
+    human_detected_subscriber = DiscordSubscriber(webhook)
 
     # event and worker threads
     bus = EventBus(name = "raven_event_bus", parallel_handlers=True)
@@ -109,7 +110,10 @@ async def main():
 
     # subscribers, registered before anything can publish so no early event (e.g. model_unavailable) is missed
     bus.on(PipelineStatus, print_status)
-    bus.on(HumanDetected, print_detection)
+    bus.on(HumanDetected, human_detected_subscriber.on_human_detected)
+
+    # send queued alerts in the background, so Discord never holds up the bus or the pipeline (NFR-05)
+    delivery_task = asyncio.create_task(human_detected_subscriber.deliver_alerts())
 
     # tell the worker thread to stop
     stop = threading.Event()
@@ -136,8 +140,21 @@ async def main():
         if worker is not None:
             await asyncio.to_thread(worker.join)
 
-        # deliver any queued events
+        # hand any remaining events to the subscribers; alerts are only queued here, not necessarily sent yet
         await bus.wait_until_idle()
+
+        # wait for queued alerts to send, with a limit so stopping during a Discord outage can't hang forever
+        try:
+            await asyncio.wait_for(human_detected_subscriber.alerts.join(), timeout=SHUTDOWN_ALERT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # list each alert that won't be sent, since the queue is lost on exit; the one being retried isn't listed, see docs/TODO.md
+            alerts = human_detected_subscriber.alerts
+
+            while not alerts.empty():
+                event = alerts.get_nowait()
+                print(f"Alert not sent: {event.frame}, detected at {time.strftime('%H:%M:%S', time.localtime(event.time))}", flush=True)
+
+        delivery_task.cancel()
 
         # stop the event bus
         await bus.stop()

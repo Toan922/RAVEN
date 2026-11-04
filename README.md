@@ -5,11 +5,10 @@ RAVEN (Rescue Aerial Vision and Emergency Navigation): an ML system that detects
 
 Run these from the repo root, in this order. Commands assume WSL / Ubuntu with Python 3.10 or newer (the team uses 3.12).
 
-**1. Clone and switch to the working branch**
+**1. Clone the repo**
 ```bash
 git clone <repo-url> RAVEN
 cd RAVEN
-git checkout RAVEN-toan-video
 ```
 
 **2. Create and activate a virtual environment** (activate it again in every new terminal)
@@ -34,7 +33,6 @@ ffmpeg -version   # should print a version
 ```
 AIResQ/images/ ...     hit-uav/images/ ...
 ```
-For the mock Discord alert (step 9) you also need the cleaned copies, `clean_HITUAV/` and `clean_AIResQ/`: download them from the Drive too, or rebuild them with the commands under [Dataset validation](#dataset-validation-validate_datasetpy).
 
 **6. Build the demo videos**
 ```bash
@@ -42,19 +40,13 @@ python -m raven.videos.splice_video
 ```
 Writes `videos/hit-uav.mp4` and `videos/AIResQ.mp4` (110 s at 10 fps each). The simulated ground station plays `hit-uav.mp4`.
 
-**7. Add your Discord credentials** in a file named `.env` at the repo root (it is gitignored, never commit it):
+**7. Add your Discord webhook** in a file named `.env` at the repo root (it is gitignored, never commit it):
 ```
 DISCORD_WEBHOOK_URL=...
-DISCORD_TOKEN=...
-DISCORD_CHANNEL_ID=...
 ```
-| Variable | Used by | Where to get it |
-|---|---|---|
-| `DISCORD_WEBHOOK_URL` | alert subscriber (`discord_bot/subscriber.py`) | In Discord: alerts channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy Webhook URL |
-| `DISCORD_TOKEN` | mock alert (`discord_bot/mock_alert.py`) | [Discord Developer Portal](https://discord.com/developers/applications) → your application → Bot → Reset Token. Invite the bot to the server with Send Messages and Attach Files permissions |
-| `DISCORD_CHANNEL_ID` | mock alert | In Discord: Settings → Advanced → Developer Mode on, then right-click the alerts channel → Copy Channel ID |
+To get one in Discord: alerts channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy Webhook URL.
 
-Ask the team lead for the team's values instead of making your own, so alerts land in the shared channel.
+Ask the team lead for the team's value instead of making your own, so alerts land in the shared channel.
 
 **8. Start the simulated drone ground station** (terminal 1, leave it running, stop with Ctrl+C)
 ```bash
@@ -66,13 +58,13 @@ It sends:
 
 Check the feeds (terminal 2): `ffplay udp://127.0.0.1:5000` shows the video and `nc -ul 5001` prints the telemetry. Close both before running RAVEN, since only one program can listen on each port.
 
-**9. Optional: send a mock alert to Discord** to check your credentials
+**9. Run RAVEN** (terminal 2, stop with Ctrl+C)
 ```bash
-python -m raven.discord_bot.mock_alert
+python -m raven.pipeline
 ```
-Posts one alert built from a random test frame to `DISCORD_CHANNEL_ID`.
+Reads the stream, runs detection, and posts alerts to the channel in `DISCORD_WEBHOOK_URL`, at most one every 10 s. Feed and detection problems print to the terminal.
 
-**Current status:** the backend stages (frame sampling, live telemetry, detection) are built, but the entry point that connects them to Discord (`pipeline.py`) is not written yet, so there is no single command that runs detection end to end. The Redis-based `discord_bot/subscriber.py` is being replaced.
+**Current status:** detection runs end to end and posts to Discord. Alerts show the drone's position, not the person's, because per-person location isn't built yet. The Detection Log and Operator Console aren't built either. See `docs/TODO.md`.
 
 **Tests**
 ```bash

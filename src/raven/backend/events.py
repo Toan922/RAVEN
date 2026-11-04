@@ -26,7 +26,7 @@ class HumanDetected(BaseEvent):
     # the newest live telemetry row when the frame was read, or None if none arrived within 2 s, see TelemetryReceiver.at_time
     telemetry: dict[str, float] | None
 
-    # the detected people, a list of {"box_xyxy": [x1, y1, x2, y2], "confidence": float}, the same format as discord_bot/mock_alert.py
+    # the detected people, a list of {"box_xyxy": [x1, y1, x2, y2], "confidence": float}
     bounding_boxes: list[dict]
 
 class PipelineStatus(BaseEvent):

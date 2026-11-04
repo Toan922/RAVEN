@@ -41,7 +41,7 @@ def load_model(bus):
 def run_model(model, frame, min_confidence):
     """
     Detect people in a frame using the YOLO model.
-    Return a list of {"box_xyxy": [x1, y1, x2, y2], "confidence": float}, the same format as discord_bot/mock_alert.py
+    Return a list of {"box_xyxy": [x1, y1, x2, y2], "confidence": float}, the format HumanDetected.bounding_boxes expects
     """
 
     # run the model on the frame and get the results
