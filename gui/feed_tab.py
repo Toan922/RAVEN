@@ -205,16 +205,35 @@ class FootagePlayer(QWidget):
         self.position_label.setMinimumWidth(240)
         self.position_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        controls = QHBoxLayout()
+        # playback buttons centered under the video; options on the left, position on the right
+        transport = QHBoxLayout()
         for widget in (self.prev_alert_button, self.step_back_button, self.play_button,
                        self.step_fwd_button, self.next_alert_button):
-            controls.addWidget(widget)
-        controls.addSpacing(8)
-        controls.addWidget(self.speed_combo)
-        controls.addSpacing(8)
-        controls.addWidget(self.boxes_check)
-        controls.addStretch(1)
-        controls.addWidget(self.position_label)
+            transport.addWidget(widget)
+
+        left = QWidget()
+        left_layout = QHBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.speed_combo)
+        left_layout.addSpacing(8)
+        left_layout.addWidget(self.boxes_check)
+        left_layout.addStretch(1)
+
+        right = QWidget()
+        right_layout = QHBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addStretch(1)
+        right_layout.addWidget(self.position_label)
+
+        # both sides get the same width, so the buttons stay in the exact middle
+        side = max(left.sizeHint().width(), right.sizeHint().width())
+        left.setMinimumWidth(side)
+        right.setMinimumWidth(side)
+
+        controls = QHBoxLayout()
+        controls.addWidget(left, 1)
+        controls.addLayout(transport)
+        controls.addWidget(right, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
