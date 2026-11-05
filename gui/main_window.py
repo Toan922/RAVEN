@@ -190,6 +190,13 @@ class MainWindow(QMainWindow):
         self.feed_tab.log.connect(self.log)
         self.feed_tab.sidebar.clear_requested.connect(self._clear_alerts)
 
+        # drone positions for the map legend's go-to links, from each feed's latest frame
+        self._positions: dict = {}
+        self._position_timer = QTimer(self)
+        self._position_timer.setInterval(1000)
+        self._position_timer.timeout.connect(self._send_drone_positions)
+        self._position_timer.start()
+
         # restart the alert feed shortly after Redis settings stop changing
         self._feed_timer = QTimer(self)
         self._feed_timer.setSingleShot(True)
@@ -354,6 +361,16 @@ class MainWindow(QMainWindow):
 
         if (config.redis_host, config.redis_port, config.stream_name) != self._feed_key:
             self._feed_timer.start()
+
+    def _send_drone_positions(self):
+        positions = {}
+        for name in self.feed_tab.live.drone_names():
+            _state, info = self.feed_tab.live.status(name)
+            if info and isinstance(info.get("lat"), (int, float)) and isinstance(info.get("lon"), (int, float)):
+                positions[name] = {"lat": info["lat"], "lon": info["lon"], "color": drone_colors.color(name)}
+        if positions != self._positions:
+            self._positions = positions
+            self.map_view.set_drone_positions(positions)
 
     # ------------------------------------------------------------------ alert feed
 

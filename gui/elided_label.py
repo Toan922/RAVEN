@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QLabel, QSizePolicy, QStyle, QStyleOption
 class ElidedLabel(QLabel):
     def __init__(self, text: str = "", parent=None, min_width: int = 40, auto_tooltip: bool = True):
         super().__init__(text, parent)
+        self.setTextFormat(Qt.PlainText)  # it draws its text itself, as plain text; put markup in a separate QLabel
         self._min_width = min_width
         self._auto_tooltip = auto_tooltip  # off when the caller sets its own tooltip
         # takes its full width when there is room, and gives it up down to min_width when there is not

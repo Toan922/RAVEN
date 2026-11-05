@@ -390,11 +390,15 @@ class FeedTab(QWidget):
         self.player.next_alert_requested.connect(lambda: self._jump_alert(1))
 
         # details of the selected alert, with the same status actions as the alerts panel
+        # the drone's color dot is its own label: the title is cut short as plain text, so it can't hold markup
+        self.alert_dot = QLabel()
+        self.alert_dot.hide()
         self.alert_title = ElidedLabel("No alert selected")
         title_font = self.alert_title.font()
         title_font.setBold(True)
         title_font.setPointSizeF(title_font.pointSizeF() * 1.1)
         self.alert_title.setFont(title_font)
+        self.alert_dot.setFont(title_font)
         self.alert_details = ElidedLabel()
         self.alert_details.setObjectName("hint")
         self.status_pill = QLabel()
@@ -408,6 +412,8 @@ class FeedTab(QWidget):
         text = QVBoxLayout()
         text.setSpacing(2)
         title_row = QHBoxLayout()
+        title_row.setSpacing(4)
+        title_row.addWidget(self.alert_dot)
         title_row.addWidget(self.alert_title)
         title_row.addWidget(self.status_pill)
         title_row.addStretch(1)
@@ -632,11 +638,14 @@ class FeedTab(QWidget):
         for button in (self.reviewed_button, self.dismiss_button, self.map_button):
             button.setEnabled(alert is not None)
         if alert is None:
+            self.alert_dot.hide()
             self.alert_title.setText("No alert selected")
             self.alert_details.setText("Double-click an alert on the Map tab, or pick one from the list.")
             self.status_pill.hide()
             return
-        self.alert_title.setText(f'<span style="color:{alert.drone_color}">●</span> {alert.drone} · {alert.title}')
+        self.alert_dot.setText(f'<span style="color:{alert.drone_color}; font-size:18px">●</span>')
+        self.alert_dot.show()
+        self.alert_title.setText(f"{alert.drone} · {alert.title}")
         where = f"{alert.lat:.5f}, {alert.lon:.5f}" if alert.has_location else "no coordinates"
         source = Path(alert.source).name if alert.source and "://" not in alert.source else (alert.source or alert.video_name)
         self.alert_details.setText(

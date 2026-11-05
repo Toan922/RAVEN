@@ -111,6 +111,7 @@ class MapView(QWebEngineView):
         # what the map should show; replayed whenever the page (re)loads so nothing is lost
         self._theme = "light"
         self._alerts: dict[str, dict] = {}
+        self._positions: dict = {}  # drone name -> latest telemetry position, replayed after a reload
         self._pending_focus: str | None = None
         self._ready = False
         self.loadStarted.connect(self._on_load_started)
@@ -136,6 +137,8 @@ class MapView(QWebEngineView):
         self._run("setTheme", self._theme)
         if self._alerts:
             self._run("addAlerts", list(self._alerts.values()))
+        if self._positions:
+            self._run("setDronePositions", self._positions)
         if self._pending_focus is not None:
             self._run("focusAlert", self._pending_focus, False)
             self._pending_focus = None
@@ -174,6 +177,16 @@ class MapView(QWebEngineView):
             if payload.get("drone") in colors:
                 payload["color"] = colors[payload["drone"]]
         self._call("setDroneColors", colors)
+
+    def set_drone_positions(self, positions: dict):
+        """
+        Where each drone's telemetry last put it ({name: {"lat", "lon", "color"}}), for the legend's go-to links.
+        """
+        self._positions = positions
+        self._call("setDronePositions", positions)
+
+    def go_to_drone(self, name: str):
+        self._call("goToDrone", name)
 
     def clear_alerts(self):
         self._alerts.clear()

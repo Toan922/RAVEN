@@ -31,6 +31,9 @@
   }
   .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;
                  vertical-align: -1px; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.25); }
+  .legend .drone-row { cursor: pointer; border-radius: 4px; padding: 2px 6px; margin: 0 -6px; user-select: none; }
+  .legend .drone-row:hover { background: rgba(0,0,0,.07); }
+  .legend .drone-row:active { background: rgba(0,0,0,.16); }
   .legend .key { color: #6b7280; margin-top: 4px; border-top: 1px solid #d3d7dd; padding-top: 4px; }
 
   /* dark mode: darken the map tiles (pins and labels keep their real colors) and the controls */
@@ -46,6 +49,8 @@
   body.dark #notice { background: #3d3214; color: #f5d68a; }
   body.dark .legend { background: rgba(45, 50, 57, .94); color: #e6e8eb; }
   body.dark .legend .key { color: #99a1ac; border-top-color: #3a4048; }
+  body.dark .legend .drone-row:hover { background: rgba(255,255,255,.09); }
+  body.dark .legend .drone-row:active { background: rgba(255,255,255,.18); }
 </style>
 </head>
 <body>
@@ -74,7 +79,7 @@ window.setTheme = function (name) { document.body.classList.toggle("dark", name 
 
 // stubs, replaced below when Leaflet loaded, so Python calls never fail offline
 window.addAlerts = window.focusAlert = window.setStatus = window.clearAlerts = window.fitAll =
-  window.setDroneColors = function () {};
+  window.setDroneColors = window.setDronePositions = window.goToDrone = function () {};
 
 if (typeof L === "undefined") {
   showNotice("The map library could not be loaded. Check the internet connection and restart the console.");
@@ -197,13 +202,19 @@ if (typeof L === "undefined") {
              fillColor: color || DEFAULT_COLOR, fillOpacity: FILL_OPACITY[status] || 0.95 };
   }
 
-  // legend: one row per drone with pins on the map, plus what the rings mean
+  // legend: one row per drone with pins or a known position, plus what the rings mean; click a drone to go to it
   var drones = {};
+  var positions = {};  // drone name -> {lat, lon, color}: where its telemetry last put it
   var Legend = L.Control.extend({
     options: { position: "bottomleft" },
     onAdd: function () {
       var el = L.DomUtil.create("div", "legend");
       L.DomEvent.disableClickPropagation(el);
+      L.DomEvent.disableScrollPropagation(el);
+      L.DomEvent.on(el, "click", function (e) {
+        var row = e.target.closest(".drone-row");
+        if (row) { goToDrone(row.getAttribute("data-drone")); }
+      });
       return el;
     }
   });
@@ -221,10 +232,14 @@ if (typeof L === "undefined") {
     var names = Object.keys(drones).sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true }); });
     if (!names.length) { el.style.display = "none"; return; }
     var rows = names.map(function (name) {
-      return '<div><span class="dot" style="background:' + drones[name] + '"></span>' + escapeHtml(name) + "</div>";
+      return '<div class="drone-row" data-drone="' + escapeHtml(name) + '" title="Go to ' + escapeHtml(name) + '">' +
+        '<span class="dot" style="background:' + drones[name] + '"></span>' + escapeHtml(name) + "</div>";
     });
-    rows.push('<div class="key">White ring: new · green ring: reviewed · faded: dismissed</div>');
-    el.innerHTML = rows.join("");
+    rows.push('<div class="key">Click a drone to go to it<br>White ring: new · green ring: reviewed · faded: dismissed</div>');
+    var html = rows.join("");
+    // only rebuild when something changed: new pins arrive many times a second, and replacing a row
+    // between mouse press and release would swallow the click
+    if (html !== el.legendHtml) { el.innerHTML = html; el.legendHtml = html; }
     el.style.display = "block";
   }
 
@@ -236,6 +251,36 @@ if (typeof L === "undefined") {
     });
     if (lifted) { bounds.extend(lifted.getLatLng()); }
     if (bounds.isValid()) { map.fitBounds(bounds.pad(0.2), { maxZoom: 17 }); }
+  };
+
+  // a drone's latest position if its telemetry gave one, otherwise the area of its pins
+  window.goToDrone = function (name) {
+    var here = positions[name];
+    if (here) {
+      map.setView([here.lat, here.lon], Math.max(map.getZoom(), 15));
+      return;
+    }
+    var bounds = L.latLngBounds([]);
+    if (clusters[name]) {
+      var b = clusters[name].getBounds();
+      if (b.isValid()) { bounds.extend(b); }
+    }
+    if (lifted && lifted.drone === name) { bounds.extend(lifted.getLatLng()); }
+    if (!bounds.isValid()) { return; }
+    if (bounds.getNorthEast().equals(bounds.getSouthWest())) {
+      map.setView(bounds.getCenter(), Math.max(map.getZoom(), 15));
+    } else {
+      map.fitBounds(bounds.pad(0.2), { maxZoom: 16 });
+    }
+  };
+
+  window.setDronePositions = function (list) {
+    positions = list;
+    var added = false;
+    Object.keys(list).forEach(function (name) {
+      if (!drones[name]) { drones[name] = list[name].color || DEFAULT_COLOR; added = true; }
+    });
+    if (added) { updateLegend(); }
   };
 
   window.addAlerts = function (list) {
@@ -312,6 +357,8 @@ if (typeof L === "undefined") {
     focused = null;
     fitted = false;
     drones = {};
+    // drones with a known position stay in the legend so they can still be found
+    Object.keys(positions).forEach(function (name) { drones[name] = positions[name].color || DEFAULT_COLOR; });
     updateLegend();
     document.getElementById("empty").style.display = "block";
   };
