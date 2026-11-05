@@ -4,6 +4,7 @@ import csv
 import sys
 import redis
 import json
+import time
 from pathlib import Path
 
 # get the root directory of the project, and make it importable when this file is run as a script
@@ -49,7 +50,7 @@ def probe_source(video_path):
 
 def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence, frame_stride,
                  stop_event=None, on_progress=None, output_dir=OUTPUT_DIR, stream_name=REDIS_STREAM_NAME,
-                 drone=None):
+                 drone=None, on_frame=None, realtime=False):
     """
     Read the video frame by frame and run the model on every frame_stride-th frame.
     Each sampled frame with people is saved to disk, matched to its telemetry row,
@@ -58,6 +59,11 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
     Optional hooks for the GUI:
     - stop_event: a threading.Event; the loop ends cleanly once it is set
     - on_progress: called with a stats dict after every sampled frame
+
+    - on_frame: called with (frame_index, frame, boxes, checked) for every frame read, for a live view;
+      boxes are the latest detections (from this frame when checked is True, else from the last checked frame)
+    - realtime: read video files at their own frame rate, like a live drone, instead of as fast as possible
+      (streams already arrive in real time)
 
     drone names the drone this feed comes from: it tags every event and keeps that drone's frames in their own
     folder, so several feeds can publish to the same stream at once.
@@ -94,6 +100,13 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
         frames_dir = Path(output_dir) / drone_folder(drone) / Path(str(video_path)).stem
     frames_dir.mkdir(parents=True, exist_ok=True)
 
+    # the latest detections, shown on the frames between checks in a live view
+    last_results = []
+
+    # when to show each frame in real time: frame i is due i / fps seconds after the start
+    started = time.monotonic()
+    pace = realtime and stats["total_frames"] > 0
+
     while True:
         # stop if the operator asked to
         if stop_event is not None and stop_event.is_set():
@@ -111,14 +124,30 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
         stats["frames_read"] = frame_index + 1
         stats["time"] = frame_index / fps
 
-        # only run the model on every frame_stride-th frame
-        if frame_index % frame_stride != 0:
-            continue
+        # wait until this frame is due when playing a file at real speed
+        if pace:
+            delay = started + frame_index / fps - time.monotonic()
+            if delay > 0:
+                if stop_event is not None:
+                    stop_event.wait(delay)
+                else:
+                    time.sleep(delay)
 
-        # detect people in the frame using the YOLO model
-        results = detect_objects(model, frame, min_confidence)
-        stats["frames_checked"] += 1
-        stats["detections"] += len(results)
+        # only run the model on every frame_stride-th frame
+        checked = frame_index % frame_stride == 0
+        if checked:
+            # detect people in the frame using the YOLO model
+            results = detect_objects(model, frame, min_confidence)
+            last_results = results
+            stats["frames_checked"] += 1
+            stats["detections"] += len(results)
+
+        # hand every frame to the live view, with the latest detections
+        if on_frame is not None:
+            on_frame(frame_index, frame, last_results, checked)
+
+        if not checked:
+            continue
 
         # report progress after every checked frame
         if on_progress is not None:

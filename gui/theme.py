@@ -9,8 +9,8 @@ from PySide6.QtSvg import QSvgRenderer
 
 ASSETS_DIR = Path(__file__).with_name("assets")
 
-# the fill color the icons in gui/assets were drawn with, swapped for the theme's text color
-ICON_SOURCE_COLOR = "#1C274C"
+# the fill colors the icons in gui/assets were drawn with, swapped for the theme's text color
+ICON_SOURCE_COLORS = ("#1C274C", "#000000")
 
 THEMES = {
     "light": {
@@ -22,6 +22,30 @@ THEMES = {
         "border": "#3a4048", "button": "#30353d", "highlight": "#4c8dff", "header": "#16181c",
     },
 }
+
+# accent colors for Settings > Appearance: name -> (light theme shade, dark theme shade)
+ACCENTS = {
+    "blue": ("#2563eb", "#4c8dff"),
+    "violet": ("#7c3aed", "#9466ff"),
+    "teal": ("#0d8a7e", "#14a394"),
+    "orange": ("#d9620f", "#ef7a2a"),
+    "rose": ("#db2763", "#ee4f86"),
+}
+DEFAULT_ACCENT = "blue"
+_accent = DEFAULT_ACCENT
+
+
+def set_accent(name: str):
+    """
+    Pick the accent color; it takes effect the next time apply_theme runs.
+    """
+    global _accent
+    _accent = name if name in ACCENTS else DEFAULT_ACCENT
+
+
+def accent_color(accent: str, theme: str) -> str:
+    return ACCENTS[accent][0 if theme == "light" else 1]
+
 
 STYLESHEET = """
 #header {{ background: {header}; border-bottom: 1px solid {border}; }}
@@ -42,13 +66,40 @@ QLabel#demoPill {{
 }}
 QLabel#hint {{ color: {muted}; }}
 QToolButton#advancedToggle {{ border: none; font-weight: bold; }}
-QFrame#videoBar {{ background: {window}; border: none; border-top: 1px solid {border}; }}
-QWidget#alertsStrip {{ background: {window}; border-left: 1px solid {border}; }}
+QFrame#videoBar {{ background: {window}; border: none; }}
+QWidget#alertsStrip {{ background: {window}; }}
 QFrame#alertInfo {{ background: {base}; border: 1px solid {border}; border-radius: 8px; }}
+QPushButton#subTab {{
+    background: {button}; color: {text}; border: 1px solid {border}; padding: 6px 18px; font-weight: 600;
+}}
+QPushButton#subTab[position="first"] {{ border-top-left-radius: 6px; border-bottom-left-radius: 6px; }}
+QPushButton#subTab[position="last"] {{ border-top-right-radius: 6px; border-bottom-right-radius: 6px; border-left: none; }}
+QPushButton#subTab:hover {{ background: {alt}; }}
+QPushButton#subTab:checked {{ background: {highlight}; color: #ffffff; border-color: {highlight}; }}
 QFrame#feedCard {{ background: {alt}; border: 1px solid {border}; border-radius: 8px; }}
 QFrame#barSeparator {{ color: {border}; }}
-QFrame#logPanel {{ background: {window}; border-left: 1px solid {border}; }}
+QFrame#logPanel {{ background: {window}; }}
 QFrame#linkBar {{ background: {window}; border-top: 1px solid {border}; }}
+QFrame#profilePanel {{ background: {base}; border: 1px solid {border}; border-radius: 10px; }}
+QLabel#profileAvatar {{ background: {alt}; border: 1px solid {border}; border-radius: 28px; }}
+QLabel#profileName {{ font-size: 17px; font-weight: 600; }}
+QLabel#profileHeading {{ color: {muted}; font-weight: 600; letter-spacing: 1px; }}
+QToolButton#eyeButton {{ border: 1px solid transparent; border-radius: 4px; padding: 0; background: transparent; }}
+QToolButton#eyeButton:hover {{ background: {alt}; border-color: {border}; }}
+QPushButton#logoutButton {{
+    background: transparent; color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 4px 12px;
+}}
+QPushButton#logoutButton:hover {{ background: {alt}; }}
+QFrame#profileDrone {{ background: {alt}; border: 1px solid {border}; border-radius: 8px; }}
+QFrame#profileDrone QLabel {{ background: transparent; }}
+QFrame#profileDrone QProgressBar {{ background: {base}; border: 1px solid {border}; border-radius: 4px; }}
+QSplitter::handle {{ background: {border}; }}
+QSplitter::handle:horizontal {{ width: 3px; }}
+QSplitter::handle:vertical {{ height: 3px; }}
+QSplitter::handle:hover, QSplitter::handle:pressed {{ background: {highlight}; }}
+QToolButton#accentSwatch {{ border: 2px solid transparent; border-radius: 15px; padding: 2px; }}
+QToolButton#accentSwatch:hover {{ border-color: {border}; }}
+QToolButton#accentSwatch:checked {{ border-color: {text}; }}
 QPushButton#backToMap {{
     background: {highlight}; color: #ffffff; border: none; border-radius: 6px;
     padding: 8px 20px; font-size: 14px; font-weight: 600;
@@ -66,14 +117,17 @@ def system_theme() -> str:
 
 
 def colors(name: str) -> dict:
-    return THEMES[name]
+    """
+    The theme's colors, with the chosen accent as its highlight.
+    """
+    return {**THEMES[name], "highlight": accent_color(_accent, name)}
 
 
 def apply_theme(app, name: str):
     """
     Switch the whole application to the light or dark theme.
     """
-    c = THEMES[name]
+    c = colors(name)
     app.setStyle("Fusion")
 
     palette = QPalette()
@@ -105,7 +159,8 @@ def themed_icon(file_name: str, name: str, size: int = 48) -> QIcon:
     Load an SVG from gui/assets and recolor it to the theme's text color, so it reads on light and dark.
     """
     svg = (ASSETS_DIR / file_name).read_text(encoding="utf-8")
-    svg = svg.replace(ICON_SOURCE_COLOR, THEMES[name]["text"]).replace(ICON_SOURCE_COLOR.lower(), THEMES[name]["text"])
+    for color in ICON_SOURCE_COLORS:
+        svg = svg.replace(color, THEMES[name]["text"]).replace(color.lower(), THEMES[name]["text"])
     renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
 
     pixmap = QPixmap(size, size)

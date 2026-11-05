@@ -18,9 +18,10 @@ from gui.feed_tab import FeedTab
 from gui.header import HeaderBar
 from gui.log_panel import LogPanel
 from gui.map_view import LinkViewer, MapView
+from gui.profile import ProfileButton
 from gui.settings_tab import SettingsTab
 from gui.shortcuts import registry
-from gui.theme import THEMES, apply_theme, system_theme
+from gui.theme import ACCENTS, DEFAULT_ACCENT, THEMES, apply_theme, set_accent, system_theme
 from gui.video_bar import VideoBar
 from gui.workers import AlertFeed, DiscordWorker, IngestWorker
 
@@ -29,6 +30,7 @@ PAGE_ACTIONS = ["page_map", "page_feed", "page_settings"]
 
 DEFAULT_SIDEBAR_WIDTH = 360
 DEFAULT_LOG_WIDTH = 520
+DEFAULT_BAR_HEIGHT = 0   # 0: the feeds bar's natural height
 
 # how long the Discord bot keeps running after ingest ends, so the last events still get sent
 DISCORD_GRACE_MS = 5000
@@ -41,7 +43,7 @@ class MainWindow(QMainWindow):
         """
         super().__init__()
         self._demo = demo
-        self.setWindowTitle("RAVEN Operator Console" + (" — DEMO" if demo else ""))
+        self.setWindowTitle("RAVEN — Rescue Aerial Vision and Emergency Navigation" + (" DEMO" if demo else ""))
         self.store = QSettings()
 
         if demo is not None:
@@ -61,6 +63,8 @@ class MainWindow(QMainWindow):
         self._discord: DiscordWorker | None = None
         self._sidebar_width = int(self.store.value("sidebar_width", DEFAULT_SIDEBAR_WIDTH))
         self._log_width = int(self.store.value("log_width", DEFAULT_LOG_WIDTH))
+        self._feed_sidebar_width = int(self.store.value("feed_sidebar_width", self._sidebar_width))
+        self._bar_height = int(self.store.value("feeds_bar_height", DEFAULT_BAR_HEIGHT))
 
         # ---- widgets
         self.model = AlertModel(self)
@@ -72,16 +76,20 @@ class MainWindow(QMainWindow):
         self.feed_tab = FeedTab(self.model, feed_sources=lambda: [feed.source for feed in self._config.feeds])
         self.log_panel = LogPanel()
 
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
         # links clicked on the map open in the link viewer, layered over the map so the map is never reloaded
         self.map_stack = QStackedWidget()
         self.map_stack.addWidget(self.map_view)
         self.map_stack.addWidget(self.link_viewer)
-        left_layout.addWidget(self.map_stack, 1)
-        left_layout.addWidget(self.video_bar)
+        # the map and the feeds bar under it, split by a handle that drags the bar taller or shorter
+        left = QSplitter(Qt.Vertical)
+        left.addWidget(self.map_stack)
+        left.addWidget(self.video_bar)
+        left.setStretchFactor(0, 1)
+        left.setStretchFactor(1, 0)
+        left.setCollapsible(0, False)
+        left.setCollapsible(1, False)
+        left.splitterMoved.connect(lambda *_: self._remember_bar_height())
+        self.map_split = left
 
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(left)
@@ -104,6 +112,12 @@ class MainWindow(QMainWindow):
 
         # header row (title, page buttons, theme toggle) above the page area
         self.header = HeaderBar(PAGE_NAMES, PAGE_ACTIONS, demo=demo is not None)
+        self.profile_button = ProfileButton(self.feed_tab.live)
+        self.header.add_trailing(self.profile_button)
+        self.profile_button.panel.duty_changed.connect(
+            lambda key: self.log(f"Status: {self.profile_button.panel.duty_combo.currentText()}"))
+        self.profile_button.panel.logout_requested.connect(
+            lambda: self.log("Log out isn't available yet: the console has no sign-in."))
         self.pages = QStackedWidget()
         for page in (self.splitter, self.feed_tab, self.settings_page):
             self.pages.addWidget(page)
@@ -127,6 +141,9 @@ class MainWindow(QMainWindow):
         self.store.remove("theme")
         self._appearance = appearance
         self._theme_override = False
+        accent = self.store.value("accent", DEFAULT_ACCENT)
+        self._accent = accent if accent in ACCENTS else DEFAULT_ACCENT
+        set_accent(self._accent)
         self.set_theme(self._default_theme())
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._system_scheme_changed)
 
@@ -148,6 +165,8 @@ class MainWindow(QMainWindow):
         self.settings_tab.log_toggle_requested.connect(self.toggle_log)
         self.settings_tab.set_appearance(self._appearance)
         self.settings_tab.appearance_changed.connect(self.set_appearance)
+        self.settings_tab.set_accent(self._accent)
+        self.settings_tab.accent_changed.connect(self.set_accent)
         self.log_panel.close_requested.connect(lambda: self.set_log_visible(False))
 
         self.video_bar.browse_requested.connect(self.settings_tab.browse_source)
@@ -183,7 +202,9 @@ class MainWindow(QMainWindow):
             self.resize(1400, 860)
         # both alerts panels (Map and Feed) are open at launch; they can still be collapsed into the right edge
         self.splitter.setSizes([max(400, self.width() - self._sidebar_width), self._sidebar_width])
-        self.feed_tab.set_sidebar_width(self._sidebar_width)
+        self.feed_tab.set_sidebar_width(self._feed_sidebar_width)
+        bar = self._bar_height or self.video_bar.sizeHint().height()
+        self.map_split.setSizes([max(300, self.height() - bar), bar])
 
         self.log("RAVEN operator console started")
         if demo is not None:
@@ -204,9 +225,11 @@ class MainWindow(QMainWindow):
         self._theme = name
         apply_theme(QApplication.instance(), name)
         self.header.set_theme(name)
+        self.profile_button.set_theme(name)
         self.map_view.set_theme(name)
         self.feed_tab.set_theme(name)
         self.video_bar.set_theme(name)
+        self.settings_tab.show_accent_shades(name)
 
     def _default_theme(self) -> str:
         return system_theme() if self._appearance == "system" else self._appearance
@@ -222,6 +245,13 @@ class MainWindow(QMainWindow):
         self.store.setValue("appearance", appearance)
         self.set_theme(self._default_theme())
         self.log(f"Default appearance: {appearance}")
+
+    def set_accent(self, accent: str):
+        self._accent = accent
+        self.store.setValue("accent", accent)
+        set_accent(accent)
+        self.set_theme(self._theme)
+        self.log(f"Accent color: {accent}")
 
     def _system_scheme_changed(self, *_):
         # "System" follows Windows switching between light and dark while the console is open
@@ -289,7 +319,8 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 saved = None
             if saved is not None:
-                for name in ("min_confidence", "frame_stride", "alert_cooldown_s", "discord_enabled", "stream_name"):
+                for name in ("min_confidence", "frame_stride", "alert_cooldown_s", "discord_enabled", "stream_name",
+                             "realtime"):
                     setattr(config, name, getattr(saved, name))
                 # saved feeds are used while their files still exist (the demo folder can be regenerated)
                 if all(os.path.isfile(f.source) and os.path.isfile(f.telemetry_path)
@@ -319,6 +350,7 @@ class MainWindow(QMainWindow):
             self.feed_tab.sidebar._update_drones()
         self.settings_tab.refresh_colors()
         self.video_bar.set_feeds(config.feeds)
+        self.feed_tab.live.set_feeds(config.feeds)
 
         if (config.redis_host, config.redis_port, config.stream_name) != self._feed_key:
             self._feed_timer.start()
@@ -403,7 +435,7 @@ class MainWindow(QMainWindow):
         Double-clicked alert: open the Feed tab on that alert's footage.
         """
         self.show_page(PAGE_NAMES.index("Feed"))
-        self.feed_tab.open_alert(alert_id)
+        self.feed_tab.review(alert_id)
 
     def _show_alert_on_map(self, alert_id: str):
         self.show_page(PAGE_NAMES.index("Map"))
@@ -430,6 +462,9 @@ class MainWindow(QMainWindow):
     def _remember_sidebar_width(self, *_):
         if not self.sidebar.is_collapsed():
             self._sidebar_width = self.splitter.sizes()[1]
+
+    def _remember_bar_height(self):
+        self._bar_height = self.map_split.sizes()[1]
 
     def _on_sidebar_collapsed(self, collapsed: bool):
         # hand the space to the map when collapsing (the splitter would otherwise leave it empty)
@@ -458,6 +493,7 @@ class MainWindow(QMainWindow):
             # demo mode swaps the YOLO model for a simulated detector
             worker = IngestWorker(config, feed, model_factory=self._demo.make_detector if self._demo else None)
             worker.progress.connect(self.video_bar.set_stats)
+            worker.frame_ready.connect(self.feed_tab.live.on_frame)
             worker.source_info.connect(self.video_bar.set_source_info)
             worker.log.connect(self.log)
             worker.failed.connect(self._on_ingest_failed)
@@ -465,6 +501,8 @@ class MainWindow(QMainWindow):
             self._ingests[feed.name] = worker
 
         self.video_bar.set_running(True, [feed.name for feed in feeds])
+        for feed in feeds:
+            self.feed_tab.live.set_state(feed.name, "starting")
         self.settings_tab.set_running(True)
         self.log(f"Starting {len(feeds)} feed(s): " + ", ".join(f"{feed.name} ({feed.source})" for feed in feeds))
         for worker in self._ingests.values():
@@ -491,10 +529,13 @@ class MainWindow(QMainWindow):
         worker = self._ingests.pop(name, None)
         if name in self._ingest_errors:
             self.video_bar.set_finished(name, "Failed", ok=False)
+            self.feed_tab.live.set_state(name, "failed", self._ingest_errors[name])
         elif worker is not None and worker.stopped_by_operator():
             self.video_bar.set_finished(name, "Stopped", ok=True)
+            self.feed_tab.live.set_state(name, "stopped")
         else:
             self.video_bar.set_finished(name, "Finished", ok=True)
+            self.feed_tab.live.set_state(name, "finished")
 
         if self._ingests:
             return
@@ -567,5 +608,7 @@ class MainWindow(QMainWindow):
         # settings are only written by Save changes (demo mode saves to its own settings)
         self.store.setValue("geometry", self.saveGeometry())
         self.store.setValue("sidebar_width", self._sidebar_width)
+        self.store.setValue("feed_sidebar_width", self.feed_tab.sidebar_width())
+        self.store.setValue("feeds_bar_height", self._bar_height)
         self.store.setValue("log_width", self._log_width)
         super().closeEvent(event)

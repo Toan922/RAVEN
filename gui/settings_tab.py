@@ -5,15 +5,17 @@ keyboard shortcuts, and the button that opens the log panel.
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 from backend.config import MAX_FEEDS, ROOT_DIR, FeedConfig, RavenConfig
 from gui.alerts import drone_colors
 from gui.shortcut_settings import ShortcutSettings
+from gui.theme import ACCENTS, accent_color
 from gui.workers import JobRunner, redis_client, send_test_alert
 
 # assumed frame rate for the "checks per second" hint until a source has been tested
@@ -272,6 +274,7 @@ class SettingsTab(QWidget):
     save_requested = Signal()
     log_toggle_requested = Signal()
     appearance_changed = Signal(str)        # "system", "light" or "dark"
+    accent_changed = Signal(str)            # a key of gui.theme.ACCENTS
     log = Signal(str)
 
     def __init__(self, config: RavenConfig, parent=None):
@@ -372,8 +375,13 @@ class SettingsTab(QWidget):
         browse_model.clicked.connect(self._browse_model)
         form.addRow("Model weights", _row(self.model_edit, browse_model))
 
+        self.realtime_check = QCheckBox("Play video files at real speed")
+        self.realtime_check.setToolTip("Off: files are processed as fast as possible. Streams always run in real time.")
+        self.realtime_check.toggled.connect(self._changed)
+        form.addRow("", self.realtime_check)
+
         self._detection_widgets = [self.confidence_slider, self.confidence_spin, self.stride_spin,
-                                   self.model_edit, browse_model]
+                                   self.model_edit, browse_model, self.realtime_check]
         return group
 
     def _build_alerts_group(self) -> QGroupBox:
@@ -422,7 +430,48 @@ class SettingsTab(QWidget):
         form.addRow("Default appearance", _row(self.appearance_combo, _hint(
             "How the console looks at launch; changes apply and save right away. The sun / moon button "
             "switches for this session only."), stretch_first=False))
+
+        # accent color: one round swatch per color, applied and saved right away
+        self._accent_group = QButtonGroup(self)
+        swatches = QHBoxLayout()
+        swatches.setContentsMargins(0, 0, 0, 0)
+        swatches.setSpacing(6)
+        for name in ACCENTS:
+            swatch = QToolButton()
+            swatch.setObjectName("accentSwatch")
+            swatch.setCheckable(True)
+            swatch.setCursor(Qt.PointingHandCursor)
+            swatch.setIconSize(QSize(20, 20))
+            swatch.setToolTip(name.capitalize())
+            swatch.setProperty("accent", name)
+            self._accent_group.addButton(swatch)
+            swatches.addWidget(swatch)
+        swatches.addStretch(1)
+        self._accent_group.buttonClicked.connect(lambda button: self.accent_changed.emit(button.property("accent")))
+        swatch_row = QWidget()
+        swatch_row.setLayout(swatches)
+        form.addRow("Accent color", swatch_row)
+        self.show_accent_shades("light")
         return group
+
+    def set_accent(self, name: str):
+        for button in self._accent_group.buttons():
+            button.setChecked(button.property("accent") == name)
+
+    def show_accent_shades(self, theme: str):
+        """
+        Draw each swatch in the shade the current theme uses.
+        """
+        for button in self._accent_group.buttons():
+            pixmap = QPixmap(40, 40)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(accent_color(button.property("accent"), theme)))
+            painter.drawEllipse(0, 0, 40, 40)
+            painter.end()
+            button.setIcon(QIcon(pixmap))
 
     def set_appearance(self, value: str):
         self.appearance_combo.blockSignals(True)
@@ -580,6 +629,7 @@ class SettingsTab(QWidget):
             min_confidence=round(self.confidence_spin.value(), 2),
             frame_stride=self.stride_spin.value(),
             model_path=self.model_edit.text().strip(),
+            realtime=self.realtime_check.isChecked(),
             alert_cooldown_s=self.cooldown_spin.value(),
             discord_enabled=self.discord_check.isChecked(),
             webhook_url=self.webhook_edit.text().strip(),
@@ -598,6 +648,7 @@ class SettingsTab(QWidget):
         self.confidence_spin.setValue(config.min_confidence)
         self.stride_spin.setValue(config.frame_stride)
         self.model_edit.setText(config.model_path)
+        self.realtime_check.setChecked(config.realtime)
         self.cooldown_spin.setValue(config.alert_cooldown_s)
         self.discord_check.setChecked(config.discord_enabled)
         self.webhook_edit.setText(config.webhook_url)

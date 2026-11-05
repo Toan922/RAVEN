@@ -85,6 +85,9 @@ class RavenConfig:
     frame_stride: int = 5
     model_path: str = str(DEFAULT_MODEL_PATH)
 
+    # read video files at their real speed, like a live drone (streams always arrive in real time)
+    realtime: bool = False
+
     # alerts
     alert_cooldown_s: float = 10.0
     discord_enabled: bool = False

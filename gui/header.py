@@ -1,5 +1,6 @@
 """
-Top row of the window: RAVEN title, big Map / Feed / Settings tab buttons, and the light/dark toggle on the far right.
+Top row of the window: RAVEN title, big Map / Feed / Settings tab buttons, then the light/dark toggle and the
+operator's profile button on the far right.
 """
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton
@@ -18,7 +19,6 @@ class HeaderBar(QFrame):
 
         brand = QLabel("RAVEN")
         brand.setObjectName("brand")
-        brand.setToolTip("Rescue Aerial Vision and Emergency Navigation")
 
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
@@ -58,6 +58,7 @@ class HeaderBar(QFrame):
             layout.addSpacing(12)
 
         layout.addWidget(self.theme_button, 0, Qt.AlignVCenter)
+        self._layout = layout
 
         registry().changed.connect(self._update_tooltips)
         self._update_tooltips()
@@ -67,6 +68,13 @@ class HeaderBar(QFrame):
             key = registry().text(action_id)
             button.setToolTip(f"{button.text()} ({key})" if key else button.text())
         self.set_theme(self._theme)
+
+    def add_trailing(self, widget):
+        """
+        Put a widget at the right end of the header, after the light/dark toggle.
+        """
+        self._layout.addSpacing(6)
+        self._layout.addWidget(widget, 0, Qt.AlignVCenter)
 
     def set_page(self, index: int):
         self._buttons[index].setChecked(True)

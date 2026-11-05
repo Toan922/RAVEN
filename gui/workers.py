@@ -4,9 +4,11 @@ Each worker reports back to the GUI thread through Qt signals.
 """
 import json
 import threading
+import time
 
 import redis
 from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtGui import QImage
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
 
@@ -133,12 +135,17 @@ class AlertFeed(QThread):
                 self._stop.wait(2)
 
 
+# how many frames a second each feed sends to the Live view
+LIVE_FPS = 15
+
+
 class IngestWorker(QThread):
     """
     Run backend.ingest on one drone feed with the shared settings: load telemetry, open the source, load the
     model, then process the video until it ends or the operator presses Stop. Every signal carries the drone name.
     """
     progress = Signal(str, dict)          # drone, stats
+    frame_ready = Signal(str, object, dict)  # drone, QImage, {"frame_index", "time", "fps", "total_frames", ...}
     source_info = Signal(str, str, dict)  # drone, source, info
     log = Signal(str)
     failed = Signal(str, str)             # drone, message
@@ -153,12 +160,36 @@ class IngestWorker(QThread):
         self.name = feed.name
         self._model_factory = model_factory
         self._stop = threading.Event()
+        self._last_frame_sent = 0.0
 
     def stop(self):
         self._stop.set()
 
     def stopped_by_operator(self) -> bool:
         return self._stop.is_set()
+
+    def _send_frame(self, telemetry, info, frame_index, frame, boxes, checked):
+        """
+        Pass a frame to the live view, at most LIVE_FPS times a second (a checked frame always goes through
+        when it's been at least half that long, so new detections show up promptly).
+        """
+        now = time.monotonic()
+        gap = now - self._last_frame_sent
+        if gap < 1 / LIVE_FPS and not (checked and gap >= 0.5 / LIVE_FPS):
+            return
+        self._last_frame_sent = now
+        from backend.ingest import telemetry_at_time
+
+        fps = info["fps"] or 30.0
+        seconds = frame_index / fps
+        row = telemetry_at_time(telemetry, seconds)
+        height, width = frame.shape[:2]
+        image = QImage(frame.data, width, height, frame.strides[0], QImage.Format_BGR888).copy()
+        self.frame_ready.emit(self.name, image, {
+            "frame_index": frame_index, "time": seconds, "fps": fps, "total_frames": info["frame_count"],
+            "boxes": boxes, "checked": checked, "lat": row.get("latitude"), "lon": row.get("longitude"),
+            "battery": row.get("battery_percent"), "source": self.feed.source,
+        })
 
     def _log(self, message: str):
         self.log.emit(f"[{self.name}] {message}")
@@ -207,6 +238,8 @@ class IngestWorker(QThread):
                 output_dir=config.output_dir,
                 stream_name=config.stream_name,
                 drone=self.name,
+                on_frame=lambda *args: self._send_frame(telemetry, info, *args),
+                realtime=config.realtime,
             )
 
             reason = "stopped by operator" if self._stop.is_set() else "end of video"

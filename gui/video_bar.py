@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
+from gui.elided_label import ElidedLabel
 from gui.alerts import drone_colors
 
 COLORS = {"green": "#30a46c", "red": "#e5484d", "amber": "#f5a524", "gray": "#8b8d98"}
@@ -52,10 +53,10 @@ class FeedRow:
 
         self.name_label = QLabel()
         self.name_label.setMinimumWidth(70)
-        self.source_label = QLabel()
-        self.source_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.source_label.setMinimumWidth(80)
-        self.info_label = QLabel()
+        # counts and times change as the feed runs; these labels cut long text short instead of growing,
+        # so the map and alerts panels keep the widths the operator set
+        self.source_label = ElidedLabel(min_width=80, auto_tooltip=False)  # its tooltip is the full source
+        self.info_label = ElidedLabel()
         self.info_label.setObjectName("hint")
 
         self.progress = QProgressBar()
@@ -65,7 +66,7 @@ class FeedRow:
         self.progress.setFormat("Idle")
         self.progress.setMinimumWidth(140)
 
-        self.stats_label = QLabel()
+        self.stats_label = ElidedLabel(min_width=60)
         self.state_light = StatusLight("Idle")
         self.browse_button = QPushButton("Browse…")
         self.browse_button.setToolTip(f"Choose the video for {name}")
@@ -156,6 +157,7 @@ class VideoBar(QFrame):
         self.feeds_grid.setVerticalSpacing(4)
         self.feeds_grid.setColumnStretch(1, 1)
         self.feeds_grid.setColumnStretch(3, 1)
+        self.feeds_grid.setColumnStretch(4, 1)  # counts share spare width with the progress bar
         self.no_feeds = QLabel("No drone feeds are turned on. Use Edit feeds to add one.")
         self.no_feeds.setObjectName("hint")
 
@@ -164,6 +166,7 @@ class VideoBar(QFrame):
         feeds_layout.setContentsMargins(0, 0, 0, 0)
         feeds_layout.addLayout(self.feeds_grid)
         feeds_layout.addWidget(self.no_feeds)
+        feeds_layout.addStretch(1)
 
         self.start_button = QPushButton(" Start")
         self.start_button.setToolTip("Start every feed that's turned on")

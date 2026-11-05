@@ -1,7 +1,7 @@
 """
 Settings section for rebinding the console's keyboard shortcuts.
 """
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QGridLayout, QGroupBox, QHBoxLayout, QKeySequenceEdit, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget,

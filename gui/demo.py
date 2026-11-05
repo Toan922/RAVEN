@@ -46,20 +46,20 @@ PEOPLE = [
 # three drones searching far-apart areas: each has its own ground (seed), people, start point and heading
 FLIGHTS = [
     {"name": "Drone 1", "file": "demo_flight_1", "seed": 7, "people": PEOPLE,
-     "start": DALLAS, "step": (0.000042, 0.000015)},
+     "start": DALLAS, "step": (0.000042, 0.000015), "battery": 92},
     {"name": "Drone 2", "file": "demo_flight_2", "seed": 11,
      "people": [
          {"heat": 232, "frames": (20, 140), "start": (420, 80), "velocity": (-1.0, 0.7)},
          {"heat": 220, "frames": (160, 280), "start": (150, 100), "velocity": (0.9, 0.5)},
      ],
-     "start": BIG_BEND, "step": (0.000030, -0.000032)},
+     "start": BIG_BEND, "step": (0.000030, -0.000032), "battery": 61},
     {"name": "Drone 3", "file": "demo_flight_3", "seed": 23,
      "people": [
          {"heat": 240, "frames": (60, 200), "start": (320, 60), "velocity": (0.2, 0.8)},
          {"heat": 228, "frames": (70, 210), "start": (345, 75), "velocity": (0.3, 0.8)},
          {"heat": 212, "frames": (220, 295), "start": (520, 120), "velocity": (-1.1, 0.4)},
      ],
-     "start": PINEY_WOODS, "step": (0.000016, 0.000040)},
+     "start": PINEY_WOODS, "step": (0.000016, 0.000040), "battery": 33},
 ]
 
 
@@ -159,16 +159,20 @@ def _make_video(path: Path, seed: int, people: list):
     writer.release()
 
 
-def _make_telemetry(path: Path, start: tuple, step: tuple):
+BATTERY_DRAIN = 0.3  # percent per second, sped up so the 30 s demo flights visibly use some
+
+
+def _make_telemetry(path: Path, start: tuple, step: tuple, battery: float):
     """
-    One row per second: the drone flies a straight line at ~5 m/s, 80 m above ground.
+    One row per second: the drone flies a straight line at ~5 m/s, 80 m above ground, its battery draining.
     """
-    lines = ["t,latitude,longitude,altitude_agl_m,camera_depression_deg,heading_deg,speed_mps"]
+    lines = ["t,latitude,longitude,altitude_agl_m,camera_depression_deg,heading_deg,speed_mps,battery_percent"]
     heading = math.degrees(math.atan2(step[1] * math.cos(math.radians(start[0])), step[0])) % 360
     for t in range(SECONDS + 1):
         lat = start[0] + t * step[0]
         lon = start[1] + t * step[1]
-        lines.append(f"{t},{lat:.6f},{lon:.6f},80,45,{heading + 3 * math.sin(t / 5):.1f},5.0")
+        charge = max(0.0, battery - t * BATTERY_DRAIN)
+        lines.append(f"{t},{lat:.6f},{lon:.6f},80,45,{heading + 3 * math.sin(t / 5):.1f},5.0,{charge:.1f}")
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -196,7 +200,7 @@ def ensure_demo_files():
 
     # telemetry is quick to write, so it's always rewritten (moving a flight doesn't need new videos)
     for flight in FLIGHTS:
-        _make_telemetry(telemetry_path(flight), flight["start"], flight["step"])
+        _make_telemetry(telemetry_path(flight), flight["start"], flight["step"], flight["battery"])
 
     # the fake Redis starts empty every launch, so frames from earlier demo runs are stale
     shutil.rmtree(FRAMES_DIR, ignore_errors=True)
@@ -238,6 +242,8 @@ class DemoBackend:
             model_path=str(DETECTOR_NOTE),
             min_confidence=0.5,
             frame_stride=3,
+            # play the flights at their real 30 s, so the Live view looks like a drone feed
+            realtime=True,
             redis_host="127.0.0.1",
             redis_port=self.port,
             output_dir=str(FRAMES_DIR),

@@ -1,6 +1,8 @@
 """
-Feed tab: review the footage behind an alert, with playback, frame-by-frame stepping, jumps between alerts,
-and its own alerts panel (sharing the alert list and statuses with the Map tab).
+Feed tab, with two subtabs chosen on the left of its top banner:
+- Live: what a drone feed is reading right now, one drone at a time (gui/live_view.py)
+- Review: the footage behind an alert, with playback, frame-by-frame stepping and jumps between alerts
+Its alerts panel shares the alert list and statuses with the Map tab.
 
 Footage is decoded with OpenCV rather than a media player so stepping lands on exact frames,
 and the detection boxes are drawn on the frames the detector actually checked.
@@ -9,20 +11,23 @@ from bisect import bisect_left, bisect_right
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QSplitter, QStyle,
+    QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QSplitter, QStackedWidget,
+    QStyle,
     QStyleOptionSlider, QToolButton, QVBoxLayout, QWidget,
 )
 
 from gui.alerts import STATUS_COLORS, Alert, AlertModel
 from gui.alerts_panel import STRIP_WIDTH, AlertsSidebar
+from gui.elided_label import ElidedLabel
+from gui.live_view import LiveView
 from gui.shortcuts import registry
 from gui.theme import media_icon
+from gui.video_canvas import VideoCanvas
 
 SPEEDS = [0.25, 0.5, 1.0, 2.0, 4.0]
-BOX_COLOR = QColor("#e5484d")
 
 
 def _clock(seconds: float, tenths=True) -> str:
@@ -47,62 +52,6 @@ def resolve_footage(alert: Alert, feed_sources: list[str]) -> tuple[str | None, 
                 and Path(candidate).is_file():
             return candidate, ""
     return None, "This alert doesn't say which video it came from. Showing the saved frame."
-
-
-class VideoCanvas(QWidget):
-    """
-    Draws the current frame scaled to fit, with detection boxes (solid on a checked frame, dashed while held),
-    or a message when there is nothing to show.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(320, 240)
-        self._image: QImage | None = None
-        self._boxes: list = []
-        self._held = False
-        self._message = "Double-click an alert, or pick one from the list on the right, to review its footage."
-
-    def show_frame(self, image: QImage | None, boxes=(), held=False, message=""):
-        self._image = image
-        self._boxes = list(boxes)
-        self._held = held
-        self._message = message
-        self.update()
-
-    def paintEvent(self, _):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#000000"))
-        if self._image is None or self._image.isNull():
-            painter.setPen(QColor("#c8ccd2"))
-            painter.drawText(self.rect().adjusted(40, 40, -40, -40), Qt.AlignCenter | Qt.TextWordWrap, self._message)
-            return
-
-        # fit the frame in the widget, keeping its aspect ratio
-        size = self._image.size().scaled(self.size(), Qt.KeepAspectRatio)
-        x = (self.width() - size.width()) / 2
-        y = (self.height() - size.height()) / 2
-        target = QRectF(x, y, size.width(), size.height())
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        painter.drawImage(target, self._image)
-
-        scale = size.width() / self._image.width()
-        pen = QPen(BOX_COLOR)
-        pen.setWidthF(2.5)
-        if self._held:
-            pen.setStyle(Qt.DashLine)
-        painter.setPen(pen)
-        painter.setRenderHint(QPainter.Antialiasing)
-        for box in self._boxes:
-            x1, y1, x2, y2 = box["box_xyxy"]
-            painter.drawRect(QRectF(QPointF(x + x1 * scale, y + y1 * scale), QPointF(x + x2 * scale, y + y2 * scale)))
-
-        if self._message:
-            painter.setPen(QColor("#ffffff"))
-            band = QRectF(0, self.height() - 34, self.width(), 34)
-            painter.fillRect(band, QColor(0, 0, 0, 160))
-            painter.drawText(band, Qt.AlignCenter, self._message)
 
 
 class TimelineSlider(QSlider):
@@ -417,8 +366,10 @@ class FootagePlayer(QWidget):
 
 class FeedTab(QWidget):
     """
-    The Feed page: footage player and alert details on the left, alerts panel on the right.
+    The Feed page: banner (Live / Review subtabs, then the drone or alert details), the live view or the
+    footage player underneath, and the alerts panel on the right.
     """
+    LIVE, REVIEW = 0, 1
     status_changed = Signal(str, str)
     show_on_map_requested = Signal(str)
     log = Signal(str)
@@ -439,14 +390,13 @@ class FeedTab(QWidget):
         self.player.next_alert_requested.connect(lambda: self._jump_alert(1))
 
         # details of the selected alert, with the same status actions as the alerts panel
-        self.alert_title = QLabel("No alert selected")
+        self.alert_title = ElidedLabel("No alert selected")
         title_font = self.alert_title.font()
         title_font.setBold(True)
         title_font.setPointSizeF(title_font.pointSizeF() * 1.1)
         self.alert_title.setFont(title_font)
-        self.alert_details = QLabel()
+        self.alert_details = ElidedLabel()
         self.alert_details.setObjectName("hint")
-        self.alert_details.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status_pill = QLabel()
         self.reviewed_button = QPushButton("Reviewed")
         self.reviewed_button.clicked.connect(lambda: self._set_status("reviewed"))
@@ -464,24 +414,67 @@ class FeedTab(QWidget):
         text.addLayout(title_row)
         text.addWidget(self.alert_details)
 
-        info = QFrame()
-        info.setObjectName("alertInfo")
-        info_layout = QHBoxLayout(info)
-        info_layout.setContentsMargins(10, 8, 10, 8)
-        info_layout.addLayout(text, 1)
+        review_banner = QWidget()
+        review_layout = QHBoxLayout(review_banner)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        review_layout.addLayout(text, 1)
         for button in (self.reviewed_button, self.dismiss_button, self.map_button):
-            info_layout.addWidget(button)
+            review_layout.addWidget(button)
+
+        self.live = LiveView(model)
+        self.live.review_requested.connect(self.review)
+
+        # Live / Review subtabs on the left of the banner; the rest of the banner shows that subtab's details
+        self.live_tab_button = QPushButton("Live")
+        self.review_tab_button = QPushButton("Review")
+        self._subtabs = QButtonGroup(self)
+        for i, button in enumerate((self.live_tab_button, self.review_tab_button)):
+            button.setObjectName("subTab")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            self._subtabs.addButton(button, i)
+        self.live_tab_button.setProperty("position", "first")
+        self.review_tab_button.setProperty("position", "last")
+        self.live_tab_button.setToolTip("Watch a drone feed as it's processed")
+        self.review_tab_button.setToolTip("Review the footage behind an alert")
+        self._subtabs.idClicked.connect(self.set_subtab)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(0)
+        tabs.addWidget(self.live_tab_button)
+        tabs.addWidget(self.review_tab_button)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setObjectName("barSeparator")
+
+        self.banner_stack = QStackedWidget()
+        self.banner_stack.addWidget(self.live.banner)
+        self.banner_stack.addWidget(review_banner)
+
+        banner = QFrame()
+        banner.setObjectName("alertInfo")
+        banner_layout = QHBoxLayout(banner)
+        banner_layout.setContentsMargins(10, 8, 10, 8)
+        banner_layout.setSpacing(12)
+        banner_layout.addLayout(tabs)
+        banner_layout.addWidget(separator)
+        banner_layout.addWidget(self.banner_stack, 1)
+
+        self.views = QStackedWidget()
+        self.views.addWidget(self.live)
+        self.views.addWidget(self.player)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(8)
-        left_layout.addWidget(info)
-        left_layout.addWidget(self.player, 1)
+        left_layout.addWidget(banner)
+        left_layout.addWidget(self.views, 1)
 
         self.sidebar = AlertsSidebar(model)
+        # a click loads the alert into Review without leaving Live; a double-click switches to Review
         self.sidebar.alert_selected.connect(self.open_alert)
-        self.sidebar.alert_activated.connect(self.open_alert)
+        self.sidebar.alert_activated.connect(self.review)
         self.sidebar.status_changed.connect(self.status_changed)
         self.sidebar.collapsed_changed.connect(self._on_sidebar_collapsed)
         self._sidebar_width = 360
@@ -492,6 +485,7 @@ class FeedTab(QWidget):
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setCollapsible(0, False)
         self.splitter.setCollapsible(1, False)
+        self.splitter.splitterMoved.connect(self._remember_sidebar_width)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -503,7 +497,9 @@ class FeedTab(QWidget):
                                 ("frame_forward", lambda: self.player.step(1)),
                                 ("previous_alert", lambda: self._jump_alert(-1)),
                                 ("next_alert", lambda: self._jump_alert(1))):
-            registry().bind(action_id, self, slot, Qt.WidgetWithChildrenShortcut)
+            # player keys only act while Review is showing
+            registry().bind(action_id, self, lambda f=slot: self.views.currentIndex() == self.REVIEW and f(),
+                            Qt.WidgetWithChildrenShortcut)
 
         # keep tick marks and boxes current while new alerts arrive for the open video
         self._refresh_timer = QTimer(self)
@@ -515,10 +511,47 @@ class FeedTab(QWidget):
         model.modelReset.connect(self._on_model_reset)
 
         self._update_details()
+        self.set_subtab(self.LIVE)
+
+    # ------------------------------------------------------------------ subtabs
+
+    def set_subtab(self, index: int):
+        if index != self.REVIEW:
+            self.player.pause()
+        self.views.setCurrentIndex(index)
+        self.banner_stack.setCurrentIndex(index)
+        self._subtabs.button(index).setChecked(True)
+
+    def subtab(self) -> int:
+        return self.views.currentIndex()
+
+    def review(self, alert_id: str):
+        """
+        Open an alert's footage and switch to the Review subtab.
+        """
+        self.open_alert(alert_id)
+        self.set_subtab(self.REVIEW)
 
     def set_sidebar_width(self, width: int):
         self._sidebar_width = width
-        self.splitter.setSizes([max(400, self.width() - width), width])
+        if self.isVisible():
+            self.splitter.setSizes([max(400, self.width() - width), width])
+        else:
+            self._width_pending = True  # a hidden splitter rescales sizes; apply once the tab is first shown
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_width_pending", False):
+            self._width_pending = False
+            side = STRIP_WIDTH if self.sidebar.is_collapsed() else self._sidebar_width
+            self.splitter.setSizes([max(400, self.width() - side), side])
+
+    def sidebar_width(self) -> int:
+        return self._sidebar_width
+
+    def _remember_sidebar_width(self, *_):
+        if not self.sidebar.is_collapsed():
+            self._sidebar_width = self.splitter.sizes()[1]
 
     def _on_sidebar_collapsed(self, collapsed: bool):
         total = sum(self.splitter.sizes()) or self.width()
