@@ -2,3 +2,10 @@ numpy>=1.24
 pillow>=10.0
 ultralytics>=8.0
 redis>=4.0
+opencv-python>=4.8
+python-dotenv>=1.0
+# operator console (python -m gui)
+PySide6>=6.6
+discord.py>=2.3
+# only for python -m gui --demo (built-in fake Redis server)
+fakeredis>=2.27

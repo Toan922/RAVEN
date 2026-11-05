@@ -1,30 +1,66 @@
+import argparse
 import cv2
 import csv
+import sys
 import redis
 import json
 from pathlib import Path
-from ultralytics import YOLO
 
-# get the root directory of the project
+# get the root directory of the project, and make it importable when this file is run as a script
 ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from backend.config import DEFAULT_MODEL_PATH, DEFAULT_OUTPUT_DIR, DEFAULT_STREAM_NAME, drone_folder
 
 # get the path to the videos directory
 VIDEOS_DIR = ROOT_DIR / "videos"
 
 # save the frames with detections here, one subfolder per video
-OUTPUT_DIR = ROOT_DIR / "runs" / "ingest"
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
 # the trained person detector
-MODEL_PATH = ROOT_DIR / "runs/detect/runs/train/yolov8n_raven/weights/best.pt"
+MODEL_PATH = DEFAULT_MODEL_PATH
 
 # name the redis stream
-REDIS_STREAM_NAME = "raven:detections"
+REDIS_STREAM_NAME = DEFAULT_STREAM_NAME
 
-def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence, frame_stride):
+def probe_source(video_path):
+    """
+    Open a video file or stream link and return its basic info without reading it through.
+    Returns {"width", "height", "fps", "frame_count"}; frame_count is 0 for live streams.
+    Raises RuntimeError if the source can't be opened.
+    """
+
+    # open the source
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    # read the properties, live streams report 0 (or negative) frames
+    info = {
+        "width": int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "fps": capture.get(cv2.CAP_PROP_FPS) or 0.0,
+        "frame_count": max(0, int(capture.get(cv2.CAP_PROP_FRAME_COUNT))),
+    }
+    capture.release()
+    return info
+
+def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence, frame_stride,
+                 stop_event=None, on_progress=None, output_dir=OUTPUT_DIR, stream_name=REDIS_STREAM_NAME,
+                 drone=None):
     """
     Read the video frame by frame and run the model on every frame_stride-th frame.
     Each sampled frame with people is saved to disk, matched to its telemetry row,
     and published to the Redis stream as one event.
+
+    Optional hooks for the GUI:
+    - stop_event: a threading.Event; the loop ends cleanly once it is set
+    - on_progress: called with a stats dict after every sampled frame
+
+    drone names the drone this feed comes from: it tags every event and keeps that drone's frames in their own
+    folder, so several feeds can publish to the same stream at once.
     """
 
     # open the video
@@ -40,21 +76,40 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
     # get the frames per second of the video, some streams report 0 so fall back to 30 to avoid dividing by zero
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
 
+    # running totals reported to on_progress, total_frames is 0 for live streams
+    stats = {
+        "frames_read": 0,
+        "frames_checked": 0,
+        "detections": 0,
+        "events_published": 0,
+        "total_frames": max(0, int(capture.get(cv2.CAP_PROP_FRAME_COUNT))),
+        "fps": fps,
+        "time": 0.0,
+    }
+
     # create the output directory for this video's frames, named after the video without extension,
     # so frames from different videos don't overwrite each other
-    frames_dir = OUTPUT_DIR / Path(video_path).stem
+    frames_dir = Path(output_dir) / Path(str(video_path)).stem
+    if drone:
+        frames_dir = Path(output_dir) / drone_folder(drone) / Path(str(video_path)).stem
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     while True:
+        # stop if the operator asked to
+        if stop_event is not None and stop_event.is_set():
+            break
+
         # Read a frame from the video
         ok, frame = capture.read()
-            
+
         # If the frame was not read successfully, break the loop
         if not ok:
             break
 
         # count every frame read, including the ones we skip, so the time stays correct
         frame_index += 1
+        stats["frames_read"] = frame_index + 1
+        stats["time"] = frame_index / fps
 
         # only run the model on every frame_stride-th frame
         if frame_index % frame_stride != 0:
@@ -62,6 +117,12 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
 
         # detect people in the frame using the YOLO model
         results = detect_objects(model, frame, min_confidence)
+        stats["frames_checked"] += 1
+        stats["detections"] += len(results)
+
+        # report progress after every checked frame
+        if on_progress is not None:
+            on_progress(dict(stats))
 
         # skip if no people are detected in the frame
         if not results:
@@ -78,6 +139,10 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
         # create the event with the frame, its telemetry and the detected people, in the format subscribers expect
         event = {
             "frame": str(frame_path),
+            # the video or stream the frame came from, so footage can be reviewed later
+            "source": str(video_path),
+            # which drone sent it, so alerts from several feeds can be told apart
+            "drone": drone or "",
             "frame_index": frame_index,
             "time": current_time,
             "telemetry": telemetry_row,
@@ -85,9 +150,16 @@ def ingest_video(video_path, telemetry_data, model, redis_client, min_confidence
         }
 
         # convert the event to a JSON string and push it to the Redis stream
-        redis_client.xadd(REDIS_STREAM_NAME, {"event": json.dumps(event)}, maxlen = 10000, approximate = True)
+        redis_client.xadd(stream_name, {"event": json.dumps(event)}, maxlen = 10000, approximate = True)
+        stats["events_published"] += 1
 
     capture.release()
+
+    # final report so the totals include the last frames read after the last checked frame
+    if on_progress is not None:
+        on_progress(dict(stats))
+
+    return stats
 
 def load_telemetry(telemetry_path):
     """
@@ -165,20 +237,30 @@ def detect_objects(model, frame, min_confidence):
     return results
 
 if __name__ == "__main__":
-    # get the path to the video to ingest and the telemetry data path
-    video_path = VIDEOS_DIR / "hit-uav.mp4"
-    telemetry_path = VIDEOS_DIR / "hit-uav_telemetry.csv"
-    
+    # pick the feed on the command line, so several drones can run at once (one process each)
+    parser = argparse.ArgumentParser(description="Detect people in one drone feed and publish alerts to Redis")
+    parser.add_argument("--video", default=str(VIDEOS_DIR / "hit-uav.mp4"), help="video file or stream link")
+    parser.add_argument("--telemetry", default=str(VIDEOS_DIR / "hit-uav_telemetry.csv"), help="telemetry CSV")
+    parser.add_argument("--drone", default="Drone 1", help="drone name that tags every alert")
+    parser.add_argument("--confidence", type=float, default=0.5, help="minimum detection confidence")
+    parser.add_argument("--stride", type=int, default=5, help="check every Nth frame")
+    parser.add_argument("--redis-host", default="localhost")
+    parser.add_argument("--redis-port", type=int, default=6379)
+    args = parser.parse_args()
+
+    # imported here so the GUI (and --help) work without loading the model library
+    from ultralytics import YOLO
+
     # load the telemetry
-    telemetry_data = load_telemetry(telemetry_path)
-    
+    telemetry_data = load_telemetry(args.telemetry)
+
     # connect to redis
-    redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+    redis_client = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
 
     # load the model
     model = YOLO(str(MODEL_PATH))
 
-    print("Model is loaded and ready to detect objects.")
+    print(f"Model is loaded and ready to detect objects on {args.drone}.")
 
-    # ingest the video, keeping detections at 50%+ confidence and checking every 5th frame
-    ingest_video(video_path, telemetry_data, model, redis_client, min_confidence=0.5, frame_stride=5)
+    ingest_video(args.video, telemetry_data, model, redis_client, min_confidence=args.confidence,
+                 frame_stride=args.stride, drone=args.drone)

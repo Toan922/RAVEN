@@ -1,6 +1,38 @@
 # RAVEN
 RAVEN (Rescue Aerial Vision and Emergency Navigation): an ML system that detects people in live IR drone video and posts geotagged alerts to Discord, helping SAR teams find missing persons without manual footage review.
 
+## Operator console (`gui/`)
+
+A PySide6 desktop app for running the detection pipeline and reviewing alerts from up to 3 drones at once. It only takes operator inputs (each drone's video file or stream link and telemetry CSV, sampling and confidence settings); nothing connects to the drones.
+
+```bash
+pip install -r requirements.txt
+python -m gui           # real Redis server + YOLO model
+python -m gui --demo    # no Redis, model or dataset needed
+```
+
+**Demo mode** (`--demo`) starts a fake Redis server inside the app (fakeredis, on a free local port), generates three 30 s synthetic thermal flights in `runs/demo/` (Drone 1 over Dallas, Drone 2 in the Big Bend desert, Drone 3 in the Piney Woods, each with its own telemetry), and swaps the YOLO model for a simulated detector that marks the warm bodies in that video (hotter people get higher confidence, so the confidence slider visibly changes what's detected). Press **Start**; everything after that (ingest, the Redis stream, alerts, the map, Discord if you turn it on) is the real code path. Demo mode saves its settings separately, so they never overwrite your real ones.
+
+The header row has the Map / Feed / Settings pages (`Ctrl+1`–`3`) and a light/dark mode toggle on the right. Every shortcut can be changed in Settings.
+
+- **Map** tab: a zoomable OpenStreetMap with a pin per alert at the drone's position (needs internet for map tiles). Pins and clusters are colored per drone (legend bottom-left); the pin's ring shows its status. A selected alert's pin stays visible at any zoom; click a cluster to zoom in or spread its pins out, and click it again to fold it back. The alerts sidebar is open at launch and collapses into the right edge: each card names its drone, a drone filter appears once alerts come from more than one drone, click a card to find its pin, double-click to review its footage, `R`/`D`/`N` to mark reviewed / dismissed / new. The feeds bar underneath has a row per drone (source, progress, counts, status, Browse), Start / Stop for all feeds (`F5` / `Shift+F5`), and the Redis / Discord status lights.
+- **Feed** tab: reviews the footage behind an alert (double-click any alert). Play/pause (`Space`), speed 0.25×–4×, one frame at a time (`←`/`→`), jump to the previous/next alert (`Ctrl+←`/`→`), and a timeline with a red tick per alert. Detection boxes are solid on the frames the detector checked and dashed while carried to the next check. It has its own alerts panel (same list and statuses as the Map tab) plus Reviewed / Dismiss / Show on map. Footage comes from the video recorded in each event's `source`; live streams aren't recorded, so their alerts show the saved frame only.
+- **Settings** tab:
+  - *Drone feeds* (up to 3): per drone a name (tags its alerts, Discord titles and saved-frames folder), on/off, video file or stream link (with *Test source*) and telemetry CSV (checked as soon as it's picked). Start runs every ticked feed in parallel.
+  - Shared by all feeds: confidence threshold, frame sample rate (shown as checks per second), model weights, Discord alerts (webhook, cooldown per drone, *Send test alert*), and under *Advanced* the Redis host/port, stream name and saved-frames folder.
+  - *Appearance*: whether the console starts in the system, light or dark theme (the header's sun/moon button switches for the current session only).
+  - *Keyboard shortcuts*: click a shortcut and press new keys; changes apply and save right away, and a key that's already taken is refused.
+  - *Save changes* (`Ctrl+S`) keeps the settings for the next launch; they can also be saved as JSON presets.
+  - *Show log* (`Ctrl+L` from anywhere) opens the log beside the form: what ingest, Redis and Discord are doing, and why something failed.
+
+Feeds can also be run without the console, one process per drone, all publishing to the same stream:
+```bash
+python backend/ingest.py --drone "Drone 1" --video videos/flight1.mp4 --telemetry videos/flight1_telemetry.csv
+python backend/ingest.py --drone "Drone 2" --video rtsp://host:554/stream --telemetry videos/flight2_telemetry.csv
+```
+
+Needs a running Redis server (`localhost:6379` by default; on Windows run it in WSL with `sudo apt install redis-server && redis-server`, or use Docker / Memurai) and `pip install ultralytics` for the model. The Discord webhook is read from `DISCORD_WEBHOOK_URL` in `.env` (gitignored) and is never written to presets. The console reads the whole `raven:detections` stream on launch, so earlier alerts reappear after a restart; reviewed/dismissed marks are remembered.
+
 ## Dataset validation (`validate_dataset.py`)
 
 Checks an image dataset before training and can write a cleaned copy. Datasets are not stored in this repo; point the script at your local copy.

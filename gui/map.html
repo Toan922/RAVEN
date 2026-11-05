@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+<style>
+  html, body, #map { height: 100%; margin: 0; background: #dfe3e8; }
+  #notice {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000;
+    background: #fff4d6; color: #5c4300; border: 1px solid #f5a524; border-radius: 6px;
+    padding: 6px 12px; font: 13px system-ui, sans-serif; display: none;
+  }
+  #empty {
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 1000;
+    background: rgba(255,255,255,.9); border-radius: 6px; padding: 6px 12px;
+    font: 13px system-ui, sans-serif; color: #444;
+  }
+  .fit-button { background: #fff; font: bold 12px system-ui, sans-serif; padding: 4px 8px; cursor: pointer; }
+  .fit-button:hover { background: #f4f4f4; }
+  .drone-cluster div {
+    width: 30px; height: 30px; margin: 5px; border-radius: 50%; color: #fff; text-align: center;
+    font: bold 12px/30px system-ui, sans-serif; box-shadow: 0 0 0 5px rgba(255,255,255,.55);
+  }
+  body.dark .drone-cluster div { box-shadow: 0 0 0 5px rgba(0,0,0,.35); }
+  .legend {
+    background: rgba(255,255,255,.92); border-radius: 6px; padding: 6px 10px; display: none;
+    font: 12px system-ui, sans-serif; color: #1c1f24; box-shadow: 0 1px 4px rgba(0,0,0,.25); line-height: 1.6;
+  }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;
+                 vertical-align: -1px; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.25); }
+  .legend .key { color: #6b7280; margin-top: 4px; border-top: 1px solid #d3d7dd; padding-top: 4px; }
+
+  /* dark mode: darken the map tiles (pins and labels keep their real colors) and the controls */
+  body.dark, body.dark #map { background: #1d2025; }
+  body.dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9); }
+  body.dark .leaflet-bar a, body.dark .fit-button { background: #2d3239; color: #e6e8eb; border-color: #3a4048; }
+  body.dark .leaflet-bar a:hover, body.dark .fit-button:hover { background: #3a4048; }
+  body.dark .leaflet-control-attribution { background: rgba(29, 32, 37, .8); color: #99a1ac; }
+  body.dark .leaflet-control-attribution a { color: #8fb4ff; }
+  body.dark .leaflet-tooltip { background: #2d3239; color: #e6e8eb; border-color: #3a4048; }
+  body.dark .leaflet-tooltip-top:before { border-top-color: #2d3239; }
+  body.dark #empty { background: rgba(45, 50, 57, .92); color: #e6e8eb; }
+  body.dark #notice { background: #3d3214; color: #f5d68a; }
+  body.dark .legend { background: rgba(45, 50, 57, .94); color: #e6e8eb; }
+  body.dark .legend .key { color: #99a1ac; border-top-color: #3a4048; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="notice"></div>
+<div id="empty">No alerts yet. Detections appear here as pins at the drone's position.</div>
+
+<script>/*QWEBCHANNEL_JS*/</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script>
+var bridge = null;
+// pins are filled with their drone's color; the ring and fading show the alert's status
+var RINGS = { "new": "#ffffff", "reviewed": "#30a46c", "dismissed": "#8b8d98" };
+var FILL_OPACITY = { "new": 0.95, "reviewed": 0.55, "dismissed": 0.2 };
+var DEFAULT_COLOR = "#0090ff";
+
+function showNotice(text) {
+  var el = document.getElementById("notice");
+  el.textContent = text;
+  el.style.display = text ? "block" : "none";
+}
+
+// works with or without Leaflet, so the page follows the theme even offline
+window.setTheme = function (name) { document.body.classList.toggle("dark", name === "dark"); };
+
+// stubs, replaced below when Leaflet loaded, so Python calls never fail offline
+window.addAlerts = window.focusAlert = window.setStatus = window.clearAlerts = window.fitAll =
+  window.setDroneColors = function () {};
+
+if (typeof L === "undefined") {
+  showNotice("The map library could not be loaded. Check the internet connection and restart the console.");
+} else {
+  var map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
+  var tilesFailing = false;
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).on("tileerror", function () {
+    if (!tilesFailing) { tilesFailing = true; showNotice("Map tiles could not be loaded. Pins still work, but the map background needs internet."); }
+  }).on("tileload", function () {
+    if (tilesFailing) { tilesFailing = false; showNotice(""); }
+  }).addTo(map);
+
+  // pins sit in their own layer above the cluster bubbles, so a spread-out cluster's pins are never covered
+  // by a neighboring bubble (Leaflet's marker pane, where the bubbles live, is 600)
+  map.createPane("pins").style.zIndex = 620;
+
+  // one cluster group per drone, so a cluster bubble only ever holds one drone's pins and wears its color
+  var clusters = {};
+  function clusterFor(drone, color) {
+    if (!clusters[drone]) {
+      var group = L.markerClusterGroup({
+        showCoverageOnHover: false, maxClusterRadius: 40,
+        // clicks are handled below, so a second click on a spread-out cluster folds it back up
+        spiderfyOnMaxZoom: false, zoomToBoundsOnClick: false,
+        spiderLegPolylineOptions: { pane: "pins", weight: 2.5, opacity: 0.9, color: color || DEFAULT_COLOR },
+        iconCreateFunction: function (c) {
+          return L.divIcon({
+            html: '<div style="background:' + (group.droneColor || DEFAULT_COLOR) + '">' + c.getChildCount() + "</div>",
+            className: "drone-cluster", iconSize: L.point(40, 40)
+          });
+        }
+      });
+      group.droneColor = color;
+      group.spread = null;
+      group.on("clusterclick", function (e) { clusterClicked(group, e.layer); });
+      group.on("spiderfied", function (e) {
+        group.spread = e.cluster;
+        // only one cluster is spread out at a time, across all drones
+        Object.keys(clusters).forEach(function (name) {
+          if (clusters[name] !== group && clusters[name].spread) { clusters[name].spread.unspiderfy(); }
+        });
+      });
+      group.on("unspiderfied", function () { group.spread = null; keepFocusVisible(); });
+      map.addLayer(group);
+      clusters[drone] = group;
+    }
+    return clusters[drone];
+  }
+
+  function clusterClicked(group, cluster) {
+    // clicking the cluster that's spread out folds it back
+    if (group.spread === cluster) { cluster.unspiderfy(); return; }
+    // otherwise zoom in, or spread the pins out when zooming in can't separate them (same as Leaflet's default)
+    var bottom = cluster;
+    while (bottom._childClusters.length === 1) { bottom = bottom._childClusters[0]; }
+    if (bottom._zoom === group._maxZoom && bottom._childCount === cluster._childCount) {
+      cluster.spiderfy();
+    } else {
+      cluster.zoomToBounds({ padding: [30, 30] });
+    }
+  }
+
+  var markers = {};
+  var highlight = null;
+  var focused = null;
+  // the selected pin is lifted out of its cluster into this layer, so it stays visible at every zoom
+  var lifted = null;
+  var liftedLayer = L.layerGroup().addTo(map);
+  var fitted = false;
+
+  function lift(marker) {
+    if (lifted === marker) { return; }
+    drop();
+    marker.cluster.removeLayer(marker);
+    liftedLayer.addLayer(marker);
+    lifted = marker;
+  }
+
+  function drop() {
+    if (!lifted) { return; }
+    var marker = lifted;
+    lifted = null;
+    liftedLayer.removeLayer(marker);
+    marker.cluster.addLayer(marker);
+  }
+
+  function drawRing() {
+    if (highlight) { map.removeLayer(highlight); highlight = null; }
+    if (!focused || !focused._map) { return; }
+    highlight = L.circleMarker(focused.getLatLng(), {
+      pane: "pins", radius: 16, weight: 3, color: "#0090ff", fill: false, interactive: false
+    }).addTo(map);
+  }
+
+  // the selected pin would vanish into a cluster after zooming out or folding a spread-out cluster: lift it out
+  function keepFocusVisible() {
+    if (focused && !focused._map) { lift(focused); }
+    drawRing();
+  }
+  map.on("zoomend", keepFocusVisible);
+
+  var FitControl = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd: function () {
+      var el = L.DomUtil.create("div", "leaflet-bar fit-button");
+      el.textContent = "Fit all";
+      el.title = "Zoom to show every alert";
+      L.DomEvent.disableClickPropagation(el);
+      L.DomEvent.on(el, "click", function () { fitAll(); });
+      return el;
+    }
+  });
+  map.addControl(new FitControl());
+
+  function styleFor(status, color) {
+    return { radius: 8, weight: status === "reviewed" ? 3 : 2, color: RINGS[status] || RINGS["new"],
+             fillColor: color || DEFAULT_COLOR, fillOpacity: FILL_OPACITY[status] || 0.95 };
+  }
+
+  // legend: one row per drone with pins on the map, plus what the rings mean
+  var drones = {};
+  var Legend = L.Control.extend({
+    options: { position: "bottomleft" },
+    onAdd: function () {
+      var el = L.DomUtil.create("div", "legend");
+      L.DomEvent.disableClickPropagation(el);
+      return el;
+    }
+  });
+  var legend = new Legend();
+  map.addControl(legend);
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function updateLegend() {
+    var el = legend.getContainer();
+    var names = Object.keys(drones).sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true }); });
+    if (!names.length) { el.style.display = "none"; return; }
+    var rows = names.map(function (name) {
+      return '<div><span class="dot" style="background:' + drones[name] + '"></span>' + escapeHtml(name) + "</div>";
+    });
+    rows.push('<div class="key">White ring: new · green ring: reviewed · faded: dismissed</div>');
+    el.innerHTML = rows.join("");
+    el.style.display = "block";
+  }
+
+  window.fitAll = function () {
+    var bounds = L.latLngBounds([]);
+    Object.keys(clusters).forEach(function (name) {
+      var b = clusters[name].getBounds();
+      if (b.isValid()) { bounds.extend(b); }
+    });
+    if (lifted) { bounds.extend(lifted.getLatLng()); }
+    if (bounds.isValid()) { map.fitBounds(bounds.pad(0.2), { maxZoom: 17 }); }
+  };
+
+  window.addAlerts = function (list) {
+    list.forEach(function (a) {
+      if (markers[a.id]) { return; }
+      var style = styleFor(a.status, a.color);
+      style.pane = "pins";
+      var marker = L.circleMarker([a.lat, a.lon], style);
+      marker.droneColor = a.color;
+      marker.drone = a.drone;
+      marker.status = a.status;
+      if (a.drone && !drones[a.drone]) { drones[a.drone] = a.color || DEFAULT_COLOR; }
+      marker.bindTooltip(a.label, { direction: "top", offset: [0, -6] });
+      marker.on("click", function () { if (bridge) { bridge.markerClicked(a.id); } focusAlert(a.id, true); });
+      markers[a.id] = marker;
+      marker.cluster = clusterFor(a.drone || "", a.color);
+      marker.cluster.addLayer(marker);
+    });
+    document.getElementById("empty").style.display = Object.keys(markers).length ? "none" : "block";
+    updateLegend();
+    // zoom to the alerts the first time some arrive, after that leave the view to the operator
+    if (!fitted && Object.keys(markers).length) { fitted = true; fitAll(); }
+  };
+
+  window.focusAlert = function (id, keepZoom) {
+    var marker = markers[id];
+    if (!marker) { return; }
+    // only the focused pin keeps its label open
+    if (focused && focused !== marker) { focused.closeTooltip(); }
+    focused = marker;
+    if (lifted && lifted !== marker) { drop(); }
+    if (keepZoom) {
+      // clicked on the map: it's already visible (on its own, or as a spread-out cluster's pin), leave it there
+      keepFocusVisible();
+    } else {
+      // picked from the list: lift it out of its cluster so it shows at once, then zoom in on it
+      lift(marker);
+      drawRing();
+      map.setView(marker.getLatLng(), Math.max(map.getZoom(), 16));
+    }
+    marker.openTooltip();
+  };
+
+  window.setStatus = function (id, status) {
+    if (markers[id]) { markers[id].status = status; markers[id].setStyle(styleFor(status, markers[id].droneColor)); }
+  };
+
+  window.setDroneColors = function (colors) {
+    Object.keys(markers).forEach(function (id) {
+      var marker = markers[id];
+      if (colors[marker.drone]) {
+        marker.droneColor = colors[marker.drone];
+        marker.setStyle(styleFor(marker.status, marker.droneColor));
+      }
+    });
+    Object.keys(colors).forEach(function (name) {
+      if (drones[name]) { drones[name] = colors[name]; }
+      if (clusters[name]) {
+        clusters[name].droneColor = colors[name];
+        clusters[name].options.spiderLegPolylineOptions.color = colors[name];
+        clusters[name].refreshClusters();
+      }
+    });
+    updateLegend();
+  };
+
+  window.clearAlerts = function () {
+    Object.keys(clusters).forEach(function (name) { map.removeLayer(clusters[name]); });
+    clusters = {};
+    liftedLayer.clearLayers();
+    lifted = null;
+    markers = {};
+    if (highlight) { map.removeLayer(highlight); highlight = null; }
+    focused = null;
+    fitted = false;
+    drones = {};
+    updateLegend();
+    document.getElementById("empty").style.display = "block";
+  };
+}
+
+new QWebChannel(qt.webChannelTransport, function (channel) {
+  bridge = channel.objects.bridge;
+  bridge.pageReady();
+});
+</script>
+</body>
+</html>
