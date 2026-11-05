@@ -1,5 +1,5 @@
 # AIResQ + HIT-UAV, person only. Built from the two --layout hituav outputs;
-# check with: python data_pipeline/check_unified.py raven.yaml
+# check with: python -m raven.data_pipeline.check_unified raven.yaml
 path: /mnt/c/Users/toan9/Documents/RAVEN
 train: [clean_AIResQ/splits/train.txt, clean_HITUAV/splits/train.txt]
 val: [clean_AIResQ/splits/val.txt, clean_HITUAV/splits/val.txt]

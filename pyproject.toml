@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raven"
+version = "0.1.0"
+description = "Rescue Aerial Vision and Emergency Navigation: detects people in IR drone video and posts alerts to Discord"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+# requirements.txt stays the single list of dependencies
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# the operator console's map page and icons
+[tool.setuptools.package-data]
+"raven.gui" = ["map.html", "assets/*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
