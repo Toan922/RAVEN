@@ -31,10 +31,23 @@ pip install -e .
 This installs everything in `requirements.txt` and makes the `raven` package importable, so modules run with `python -m raven.<package>.<module>`. Code edits take effect without reinstalling.
 
 **4. Install ffmpeg** (a system program, not a pip package, so it does not go in the venv)
-```bash
-sudo apt install ffmpeg
-ffmpeg -version   # should print a version
-```
+- **macOS:**
+  ```bash
+  brew install ffmpeg
+  ffmpeg -version   # should print a version
+  ```
+
+- **Windows:**
+  ```powershell
+  winget install Gyan.FFmpeg
+  ffmpeg -version   # restart terminal first if not recognized
+  ```
+
+- **Linux / WSL:**
+  ```bash
+  sudo apt install ffmpeg
+  ffmpeg -version   # should print a version
+  ```
 
 **5. Get the datasets** (not stored in Git). Download them from the team Google Drive and put them at the repo root:
 ```
