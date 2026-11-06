@@ -13,7 +13,7 @@ import time
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtGui import QImage
 
-from raven.backend.config import FeedConfig, RavenConfig
+from raven.backend.config import FeedConfig, RavenConfig, parse_udp_address, stride_for
 from raven.backend.detection_log import event_record
 from raven.backend.events import HumanDetected, PipelineStatus
 
@@ -71,6 +71,7 @@ class AlertFeed(QObject):
     """
     events = Signal(list)   # list of (event id, event record dict), oldest first, see detection_log.event_record
     status = Signal(str)    # a readable PipelineStatus line for the log
+    pipeline_status = Signal(str, str, str)  # drone, status (e.g. "feed_interrupted"), message
 
     def __init__(self, bus, parent=None):
         super().__init__(parent)
@@ -84,6 +85,7 @@ class AlertFeed(QObject):
     def _on_status(self, event):
         drone = f"[{event.drone}] " if event.drone else ""
         self.status.emit(f"{drone}{event.status.replace('_', ' ')} ({event.source}): {event.message}")
+        self.pipeline_status.emit(event.drone, event.status, event.message)
 
 
 # how many frames a second each feed sends to the Live view
@@ -115,6 +117,7 @@ class IngestWorker(QThread):
         self._model_factory = model_factory
         self._stop = threading.Event()
         self._last_frame_sent = 0.0
+        self._sent_source_info = False
 
     def stop(self):
         self._stop.set()
@@ -124,25 +127,49 @@ class IngestWorker(QThread):
 
     def _send_frame(self, telemetry, info, frame_index, frame, boxes, checked):
         """
-        Pass a frame to the live view, at most LIVE_FPS times a second (a checked frame always goes through
+        A frame from a recorded video: its telemetry row comes from the CSV at its time in the video.
+        """
+        if not self._frame_due(checked):
+            return
+        from raven.backend.file_ingest import telemetry_at_time
+
+        fps = info["fps"] or 30.0
+        seconds = frame_index / fps
+        self._emit_frame(frame_index, frame, boxes, checked, telemetry_at_time(telemetry, seconds), seconds,
+                         fps, info["frame_count"])
+
+    def _send_live_frame(self, frame_index, frame, boxes, checked, row, seconds):
+        """
+        A frame from a live stream: its telemetry is the newest UDP row, or None while telemetry is lost.
+        """
+        if not self._sent_source_info:
+            # a stream isn't probed before it starts (opening it can take seconds), so report its size here
+            self._sent_source_info = True
+            height, width = frame.shape[:2]
+            self.source_info.emit(self.name, self.feed.source,
+                                  {"width": width, "height": height, "fps": 0.0, "frame_count": 0})
+        if self._frame_due(checked):
+            self._emit_frame(frame_index, frame, boxes, checked, row or {}, seconds, 0.0, 0)
+
+    def _frame_due(self, checked) -> bool:
+        """
+        Pass frames to the live view at most LIVE_FPS times a second (a checked frame always goes through
         when it's been at least half that long, so new detections show up promptly).
         """
         now = time.monotonic()
         gap = now - self._last_frame_sent
         if gap < 1 / LIVE_FPS and not (checked and gap >= 0.5 / LIVE_FPS):
-            return
+            return False
         self._last_frame_sent = now
-        from raven.backend.file_ingest import telemetry_at_time
+        return True
 
-        fps = info["fps"] or 30.0
-        seconds = frame_index / fps
-        row = telemetry_at_time(telemetry, seconds)
+    def _emit_frame(self, frame_index, frame, boxes, checked, row, seconds, fps, total_frames):
         height, width = frame.shape[:2]
         image = QImage(frame.data, width, height, frame.strides[0], QImage.Format_BGR888).copy()
         self.frame_ready.emit(self.name, image, {
-            "frame_index": frame_index, "time": seconds, "fps": fps, "total_frames": info["frame_count"],
+            "frame_index": frame_index, "time": seconds, "fps": fps, "total_frames": total_frames,
             "boxes": boxes, "checked": checked, "lat": row.get("latitude"), "lon": row.get("longitude"),
-            "battery": row.get("battery_percent"), "source": self.feed.source,
+            "battery": row.get("battery_percent"), "source": self.feed.source, "live": self.feed.is_live(),
         })
 
     def _log(self, message: str):
@@ -162,42 +189,73 @@ class IngestWorker(QThread):
         return load_model(self._bus, config.model_path)
 
     def run(self):
+        try:
+            if self.feed.is_live():
+                self._run_live()
+            else:
+                self._run_file()
+        except Exception as error:  # surface every failure in the GUI instead of killing the thread silently
+            self.failed.emit(self.name, str(error) or type(error).__name__)
+
+    def _run_live(self):
+        from raven.backend.stream_ingest import ingest_stream
+
+        config, feed = self._config, self.feed
+        address = parse_udp_address(feed.telemetry_path)
+        self._log(f"Loading model {config.model_path} ...")
+        model = self._load_model()
+        if self._stop.is_set():
+            self._log("Ingest cancelled before it started")
+            return
+        self._log(f"Live ingest started: {feed.source} with telemetry on {feed.telemetry_path}, "
+                  f"confidence >= {config.min_confidence:.2f}, checking {config.analysis_fps:g} frame(s)/sec")
+        try:
+            stats = ingest_stream(
+                feed.source, address, model, self._bus, config.min_confidence, config.analysis_fps,
+                config.output_dir, self._stop,
+                on_progress=lambda stats: self.progress.emit(self.name, stats),
+                drone=self.name,
+                on_frame=self._send_live_frame,
+            )
+        except OSError as error:
+            raise RuntimeError(f"Could not listen for telemetry on {feed.telemetry_path}: {error}") from None
+        self._log(f"Live ingest stopped: {stats['frames_read']} frames read, {stats['frames_checked']} checked, "
+                  f"{stats['events_published']} alerts published")
+
+    def _run_file(self):
         from raven.backend import file_ingest
 
         config, feed = self._config, self.feed
-        try:
-            telemetry = file_ingest.load_telemetry(feed.telemetry_path)
-            self._log(f"Loaded {len(telemetry)} telemetry rows from {feed.telemetry_path}")
+        telemetry = file_ingest.load_telemetry(feed.telemetry_path)
+        self._log(f"Loaded {len(telemetry)} telemetry rows from {feed.telemetry_path}")
 
-            info = file_ingest.probe_source(feed.source)
-            self.source_info.emit(self.name, feed.source, info)
-            self._log(f"Opened {feed.source} ({info['width']}x{info['height']}, {info['fps']:.1f} fps)")
+        info = file_ingest.probe_source(feed.source)
+        self.source_info.emit(self.name, feed.source, info)
+        self._log(f"Opened {feed.source} ({info['width']}x{info['height']}, {info['fps']:.1f} fps)")
 
-            self._log(f"Loading model {config.model_path} ...")
-            model = self._load_model()
+        self._log(f"Loading model {config.model_path} ...")
+        model = self._load_model()
 
-            if self._stop.is_set():
-                self._log("Ingest cancelled before it started")
-                return
+        if self._stop.is_set():
+            self._log("Ingest cancelled before it started")
+            return
 
-            self._log(f"Ingest started: confidence >= {config.min_confidence:.2f}, "
-                      f"checking every {config.frame_stride} frame(s)")
-            stats = file_ingest.ingest_video(
-                feed.source, telemetry, model, self._bus,
-                config.min_confidence, config.frame_stride, config.output_dir,
-                stop_event=self._stop,
-                on_progress=lambda stats: self.progress.emit(self.name, stats),
-                drone=self.name,
-                on_frame=lambda *args: self._send_frame(telemetry, info, *args),
-                realtime=config.realtime,
-            )
+        stride = stride_for(info["fps"] or 30.0, config.analysis_fps)
+        self._log(f"Ingest started: confidence >= {config.min_confidence:.2f}, "
+                  f"checking {config.analysis_fps:g} frame(s)/sec (every {stride} frame(s))")
+        stats = file_ingest.ingest_video(
+            feed.source, telemetry, model, self._bus,
+            config.min_confidence, config.analysis_fps, config.output_dir,
+            stop_event=self._stop,
+            on_progress=lambda stats: self.progress.emit(self.name, stats),
+            drone=self.name,
+            on_frame=lambda *args: self._send_frame(telemetry, info, *args),
+            realtime=config.realtime,
+        )
 
-            reason = "stopped by operator" if self._stop.is_set() else "end of video"
-            self._log(f"Ingest finished ({reason}): {stats['frames_read']} frames read, "
-                      f"{stats['frames_checked']} checked, {stats['events_published']} alerts published")
-
-        except Exception as error:  # surface every failure in the GUI instead of killing the thread silently
-            self.failed.emit(self.name, str(error) or type(error).__name__)
+        reason = "stopped by operator" if self._stop.is_set() else "end of video"
+        self._log(f"Ingest finished ({reason}): {stats['frames_read']} frames read, "
+                  f"{stats['frames_checked']} checked, {stats['events_published']} alerts published")
 
 
 class DiscordAlerts(QObject):
@@ -205,6 +263,9 @@ class DiscordAlerts(QObject):
     Discord alerts for the console: while on, raven.discord_bot.subscriber.DiscordSubscriber receives HumanDetected
     from the bus with the operator's webhook and cooldown, and sends alerts from its own task on the bus thread,
     retrying failed sends until they go through.
+
+    Every alert queued is also written to the outbox (raven.backend.outbox) in the saved frames folder and marked
+    sent once delivered, so alerts that didn't go out before the console closed are sent the next time Discord starts.
     """
     state_changed = Signal(str, str)   # status light color, detail
     log = Signal(str)
@@ -216,6 +277,9 @@ class DiscordAlerts(QObject):
         # only used on the bus thread
         self._subscriber = None
         self._task = None
+        self._outbox = None
+        # outbox ids queued in this launch, so replaying the outbox never queues one twice
+        self._queued: set[str] = set()
         # bubus has no way to remove a handler, so one handler stays registered and forwards while Discord is on
         bus.on(HumanDetected, self._on_human_detected)
 
@@ -227,11 +291,26 @@ class DiscordAlerts(QObject):
     def is_running(self) -> bool:
         return self._running
 
+    @staticmethod
+    def outbox_for(config: RavenConfig):
+        from pathlib import Path
+
+        from raven.backend.outbox import OUTBOX_NAME, Outbox
+
+        return Outbox(Path(config.output_dir) / OUTBOX_NAME)
+
+    def unsent(self) -> int:
+        """
+        Alerts queued for Discord that haven't been delivered yet (0 before Discord was first started).
+        """
+        return len(self._outbox.pending()) if self._outbox is not None else 0
+
     def start(self, config: RavenConfig):
         if self._running:
             return
         import discord
-        from raven.discord_bot.subscriber import DiscordSubscriber
+        from raven.backend.events import HumanDetected as Event
+        from raven.discord_bot.subscriber import DiscordSubscriber, should_alert
 
         try:
             webhook = discord.SyncWebhook.from_url(config.webhook_url)
@@ -241,7 +320,21 @@ class DiscordAlerts(QObject):
             self.log.emit(f"Discord alerts not started: {message}")
             return
 
+        outbox = self.outbox_for(config)
+        self._outbox = outbox
+        queued = self._queued
+
+        class OutboxSubscriber(DiscordSubscriber):
+            async def on_human_detected(self, event):
+                # write it down before queueing it, so a crash right after still leaves it in the outbox
+                if should_alert(event, self.last_alert_times.get(getattr(event, "drone", "")), self.cooldown):
+                    record = event_record(event)
+                    outbox.add(record)
+                    queued.add(record["id"])
+                await super().on_human_detected(event)
+
         def sent(event):
+            outbox.mark_sent(str(event.event_id))
             people = len(event.bounding_boxes)
             drone = event.drone or "unnamed drone"
             when = f"video {event.video_time:.1f} s" if event.video_time is not None else time.strftime(
@@ -253,14 +346,32 @@ class DiscordAlerts(QObject):
             self.state_changed.emit("amber", f"Retrying: {error}")
             self.log.emit(f"Discord alert for {event.drone or 'unnamed drone'} failed ({error}), retrying")
 
+        # alerts from an earlier launch that never went out are sent first, without a cooldown
+        replay = []
+        for record in outbox.pending():
+            if record["id"] in queued:
+                continue
+            try:
+                fields = {key: value for key, value in record.items() if key != "id"}
+                replay.append(Event(event_id=record["id"], **fields))
+            except Exception as error:  # a record the event no longer accepts: drop it rather than block the queue
+                self.log.emit(f"Dropped an unsendable Discord alert from the outbox: {error}")
+                outbox.mark_sent(record["id"])
+                continue
+            queued.add(record["id"])
+
         def install():
-            self._subscriber = DiscordSubscriber(webhook, cooldown=config.alert_cooldown_s, on_sent=sent, on_error=failed)
+            self._subscriber = OutboxSubscriber(webhook, cooldown=config.alert_cooldown_s, on_sent=sent, on_error=failed)
+            for event in replay:
+                self._subscriber.alerts.put_nowait(event)
             self._task = asyncio.get_running_loop().create_task(self._subscriber.deliver_alerts())
 
         self._bus.call(install)
         self._running = True
         self.state_changed.emit("green", "Sending alerts (cooldown per drone)")
         self.log.emit(f"Discord alerts on (cooldown {config.alert_cooldown_s:g} s per drone)")
+        if replay:
+            self.log.emit(f"Sending {len(replay)} Discord alert(s) left over from earlier")
 
     def stop(self, timeout=DISCORD_SHUTDOWN_TIMEOUT_S, wait=False):
         """
@@ -295,8 +406,14 @@ class DiscordAlerts(QObject):
                 self.log.emit(f"Stopping Discord alerts failed: {error}")
                 unsent = []
             for event in unsent:
-                self.log.emit(f"Discord alert not sent: {event.drone or 'unnamed drone'}, {event.frame}")
+                # it stays in the outbox, so a later start (or launch) sends it
+                self._queued.discard(str(event.event_id))
+                self.log.emit(f"Discord alert not sent yet, kept for later: {event.drone or 'unnamed drone'}, "
+                              f"{event.frame}")
             if not self._running:
+                # the alert being retried when Discord stopped isn't in the queue either; it's still in the outbox,
+                # so let a later start send everything left there
+                self._queued.clear()
                 self.state_changed.emit("gray", "Off")
                 self.log.emit("Discord alerts off")
 

@@ -90,12 +90,45 @@ class Alert:
         return max((box.get("confidence", 0) for box in self.boxes), default=0.0)
 
     @property
+    def location_status(self) -> str:
+        """
+        "estimated" (the person's ground position), "approximate" (the drone's position) or "unavailable".
+        Alerts from before geotagging only have the drone's position, which is approximate.
+        """
+        status = self.event.get("location_status") or ""
+        if status in ("estimated", "approximate", "unavailable"):
+            return status
+        telemetry = self.event.get("telemetry") or {}
+        return "approximate" if "latitude" in telemetry and "longitude" in telemetry else "unavailable"
+
+    @property
+    def is_approximate(self) -> bool:
+        return self.location_status == "approximate"
+
+    def _position(self) -> dict:
+        if self.location_status == "estimated" and self.event.get("location"):
+            return self.event["location"]
+        if self.location_status == "unavailable":
+            return {}
+        return self.event.get("telemetry") or {}
+
+    @property
     def lat(self):
-        return (self.event.get("telemetry") or {}).get("latitude")
+        return self._position().get("latitude")
 
     @property
     def lon(self):
-        return (self.event.get("telemetry") or {}).get("longitude")
+        return self._position().get("longitude")
+
+    @property
+    def where(self) -> str:
+        """
+        The coordinates for cards and the log, marked when they're only the drone's position.
+        """
+        if not self.has_location:
+            return "no location"
+        text = f"{self.lat:.5f}, {self.lon:.5f}"
+        return f"≈ {text} (approx.)" if self.is_approximate else text
 
     @property
     def has_location(self) -> bool:
@@ -138,6 +171,18 @@ class Alert:
         return _clock(self.seconds)
 
     @property
+    def is_live(self) -> bool:
+        # live streams don't have a time into the video
+        return self.event.get("video_time") is None
+
+    @property
+    def when(self) -> str:
+        """
+        "video 0:12" for a recorded video, "live 18:20:53" for a live stream.
+        """
+        return f"live {self.received:%H:%M:%S}" if self.is_live else f"video {self.video_time}"
+
+    @property
     def received(self) -> datetime:
         # the wall-clock time the frame was read
         return datetime.fromtimestamp(float(self.event.get("time") or 0.0))
@@ -148,9 +193,9 @@ class Alert:
         return f"{people} · {self.confidence:.0%}"
 
     def map_payload(self) -> dict:
-        return {"id": self.id, "lat": self.lat, "lon": self.lon, "status": self.status,
+        return {"id": self.id, "lat": self.lat, "lon": self.lon, "status": self.status, "approx": self.is_approximate,
                 "drone": self.drone, "color": self.drone_color,
-                "label": f"{self.drone}: {self.title} · {self.video_time}"}
+                "label": f"{self.drone}: {self.title} · {self.when}"}
 
 
 class AlertModel(QAbstractListModel):
@@ -264,12 +309,24 @@ class AlertFilter(QSortFilterProxyModel):
         return alert.status == self.MODES[self._mode]
 
 
+def load_frame(path: str) -> QImage:
+    """
+    A saved frame as a QImage, decrypted in memory (a null image if it's missing or can't be read).
+    """
+    from raven.backend.vault import VaultError, read_bytes
+
+    try:
+        return QImage.fromData(read_bytes(path)) if path else QImage()
+    except (OSError, VaultError):
+        return QImage()
+
+
 def frame_with_boxes(alert: Alert, max_size=None) -> QPixmap | None:
     """
     Load the alert's saved frame and draw its bounding boxes, optionally scaled down to fit max_size (w, h).
     Boxes are drawn after scaling so they stay visible on small thumbnails. Returns None if the frame is missing.
     """
-    image = QImage(alert.frame_path)
+    image = load_frame(alert.frame_path)
     if image.isNull():
         return None
 

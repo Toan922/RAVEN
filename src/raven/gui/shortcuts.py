@@ -13,7 +13,8 @@ from PySide6.QtGui import QKeySequence, QShortcut
 ACTIONS = [
     ("page_map", "Pages", "Go to the Map tab", "Ctrl+1"),
     ("page_feed", "Pages", "Go to the Feed tab", "Ctrl+2"),
-    ("page_settings", "Pages", "Go to the Settings tab", "Ctrl+3"),
+    ("page_manage", "Pages", "Go to the Manage tab", "Ctrl+3"),
+    ("page_settings", "Pages", "Go to the Settings tab", "Ctrl+4"),
     ("show_log", "Pages", "Show / hide the log", "Ctrl+L"),
     ("toggle_theme", "Pages", "Switch light / dark mode", "Ctrl+Shift+T"),
     ("save_settings", "Run", "Save settings changes", "Ctrl+S"),

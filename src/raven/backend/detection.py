@@ -6,8 +6,13 @@ Frames that fail analysis are skipped and reported on the bus, and the operator 
 failures persist (FR-14.1, FR-14.2).
 """
 
-import numpy as np
+import hashlib
+import shutil
+import tempfile
 from pathlib import Path
+
+import numpy as np
+
 from raven.backend.events import PipelineStatus
 
 # get the root directory of the project
@@ -18,6 +23,26 @@ MODEL_PATH = ROOT_DIR / "runs/detect/runs/train/yolov8n_raven/weights/best.pt"
 
 # how many frames in a row can fail analysis before the operator is notified (FR-14.2)
 MAX_CONSECUTIVE_FAILED_FRAMES = 3
+
+def loadable_path(model_path) -> str:
+    """
+    The path to give ultralytics for model_path. Ultralytics removes apostrophes from weight paths before opening
+    them (attempt_download_asset), so weights in a folder like "Fall '26" are loaded from a copy in the temp folder,
+    made once per version of the file.
+    """
+    path = Path(model_path)
+    if "'" not in str(path) or not path.is_file():
+        return str(path)
+    stat = path.stat()
+    key = hashlib.sha1(f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()[:12]
+    copy = Path(tempfile.gettempdir()) / "raven-weights" / key / path.name
+    if "'" in str(copy):
+        return str(path)   # the temp folder has one too; nothing better to try
+    if not copy.is_file():
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, copy)
+    return str(copy)
+
 
 def load_model(bus, model_path=MODEL_PATH):
     """
@@ -30,7 +55,7 @@ def load_model(bus, model_path=MODEL_PATH):
         # imported here so code that only needs run_model (e.g. the operator console's demo mode) doesn't load torch
         from ultralytics import YOLO
 
-        model = YOLO(str(model_path))
+        model = YOLO(loadable_path(model_path))
         # warm up the model with a dummy input to ensure it is ready for inference
         model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
         return model

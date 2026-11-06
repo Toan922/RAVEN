@@ -15,6 +15,10 @@ STREAM_TIMEOUT_MSEC = 10000 # milliseconds
 # how long a stream can be stalled for (FR-13.2)
 STREAM_STALL_TIMEOUT_MSEC = 3000 # milliseconds
 
+# how long a stream can stay open without a picture before it's reported as feed_unsupported (FR-04.2); a stream
+# joined between keyframes has no picture size until the next keyframe, so this allows a few keyframe intervals
+UNSUPPORTED_AFTER_SECONDS = 30
+
 def open_stream(stream_url):
     """
     Open the video stream at stream_url with FFmpeg, giving up after STREAM_TIMEOUT_MSEC if it doesn't open,
@@ -28,7 +32,7 @@ def open_stream(stream_url):
          cv2.CAP_PROP_READ_TIMEOUT_MSEC, STREAM_STALL_TIMEOUT_MSEC],
     )
 
-def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, stop):
+def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, stop, on_frame=None, drone=""):
     """
     Read the video stream (e.g. udp://127.0.0.1:5000) frame by frame and keep about frames_per_second_rate
     frames per second (FR-05), each matched to the newest live telemetry row from telemetry_receiver (FR-06).
@@ -41,10 +45,17 @@ def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, st
     Checks stop (a threading.Event) on every frame read and every reconnect attempt, and returns once it is set:
     within about one frame while streaming, STREAM_STALL_TIMEOUT_MSEC if the feed is stalled, and
     STREAM_TIMEOUT_MSEC while waiting for it to open. The stream is released whenever the generator ends.
+
+    Optional, for the operator console:
+    - on_frame(frame_index, frame, kept) is called for every frame read, kept or not, for a live view
+    - drone tags every PipelineStatus, so the console can tell several feeds apart
     """
 
     # check if there has been a stream issue reported
     problem_reported = False
+
+    # when the stream first opened without a picture, None while it has one
+    undecodable_since = None
 
     while True:
         # open the video
@@ -53,7 +64,7 @@ def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, st
         # keep retrying until the stream opens, reporting feed_missing only on the first failure
         while not capture.isOpened():
             if not problem_reported:
-                bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_missing", message=f"No feed from {stream_url} within {STREAM_TIMEOUT_MSEC // 1000} seconds, still waiting"))
+                bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_missing", drone=drone, message=f"No feed from {stream_url} within {STREAM_TIMEOUT_MSEC // 1000} seconds, still waiting"))
                 problem_reported = True
 
             # check if the stop event has been set
@@ -62,9 +73,24 @@ def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, st
 
             capture = open_stream(stream_url)
 
+        # a stream that keeps opening without a picture size can't be decoded (FR-04.2): report it once, then retry
+        if capture.get(cv2.CAP_PROP_FRAME_WIDTH) <= 0 or capture.get(cv2.CAP_PROP_FRAME_HEIGHT) <= 0:
+            capture.release()
+            if undecodable_since is None:
+                undecodable_since = time.monotonic()
+            if not problem_reported and time.monotonic() - undecodable_since >= UNSUPPORTED_AFTER_SECONDS:
+                bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_unsupported", drone=drone, message=f"The video from {stream_url} can't be decoded, still trying"))
+                problem_reported = True
+            if stop.is_set():
+                return
+            time.sleep(1)
+            continue
+
+        undecodable_since = None
+
         # publish feed_resumed if a feed problem (missing or interrupted) was reported
         if problem_reported:
-            bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_resumed", message=f"Feed from {stream_url} is now available"))
+            bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_resumed", drone=drone, message=f"Feed from {stream_url} is now available"))
             problem_reported = False
 
         # frame counter, starts at -1 so the first frame read is index 0
@@ -94,7 +120,10 @@ def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, st
                 frame_index += 1
 
                 # only keep every frame_stride-th frame
-                if frame_index % frame_stride != 0:
+                kept = frame_index % frame_stride == 0
+                if on_frame is not None:
+                    on_frame(frame_index, frame, kept)
+                if not kept:
                     continue
 
                 # stamp the frame with RAVEN's clock, the same clock the telemetry receiver stamps rows with,
@@ -109,6 +138,6 @@ def sample_frame(stream_url, telemetry_receiver, frames_per_second_rate, bus, st
             capture.release()
 
         # only reach here if there is a failure to read frames from the video stream
-        bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_interrupted", message=f"Failed to read frames from {stream_url}"))
+        bus.dispatch(PipelineStatus(source="video_ingestion", status="feed_interrupted", drone=drone, message=f"Failed to read frames from {stream_url}"))
         problem_reported = True
 

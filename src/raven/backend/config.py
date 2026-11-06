@@ -25,6 +25,45 @@ SECRET_FIELDS = {"webhook_url"}
 # how many drone feeds can run at once
 MAX_FEEDS = 3
 
+# frames analysed per second of video (FR-05 asks for 1 to 2)
+MIN_ANALYSIS_FPS = 1.0
+MAX_ANALYSIS_FPS = 2.0
+
+
+def is_udp_address(text: str) -> bool:
+    return text.strip().lower().startswith("udp://")
+
+
+def parse_udp_address(text: str) -> tuple[str, int]:
+    """
+    Split "udp://host:port" into (host, port). Raises ValueError with a readable message if it isn't one.
+    """
+    rest = text.strip()[len("udp://"):] if is_udp_address(text) else ""
+    host, _, port = rest.rpartition(":")
+    host = host.strip("[]") or ""
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"not a udp://host:port address: {text.strip()}")
+    return host, int(port)
+
+
+def udp_port(text: str) -> int | None:
+    """
+    The port of a udp:// link, or None for anything else (files, rtsp://, a malformed link).
+    """
+    try:
+        return parse_udp_address(text)[1]
+    except ValueError:
+        return None
+
+
+def stride_for(video_fps: float, analysis_fps: float) -> int:
+    """
+    How many frames to step between checks so about analysis_fps frames are analysed each second.
+    """
+    if not video_fps or video_fps <= 0 or not analysis_fps or analysis_fps <= 0:
+        return 1
+    return max(1, round(video_fps / analysis_fps))
+
 
 def drone_folder(name: str) -> str:
     """
@@ -36,14 +75,15 @@ def drone_folder(name: str) -> str:
 @dataclass
 class FeedConfig:
     """
-    One drone feed: its name (tags every alert), video file or stream link, and telemetry CSV.
+    One drone feed: its name (tags every alert), video file or stream link, and telemetry: a CSV file, or
+    udp://host:port for live telemetry from the ground station.
     """
     name: str = "Drone 1"
 
     # a video file path or a stream link (rtsp://, http://, ...)
     source: str = ""
 
-    # telemetry CSV with at least t, latitude, longitude columns
+    # telemetry CSV with at least t, latitude, longitude columns, or udp://host:port for live JSON telemetry
     telemetry_path: str = ""
 
     # turned-off feeds stay in the list but don't run
@@ -70,10 +110,64 @@ class FeedConfig:
         elif "://" not in self.source and not Path(self.source).is_file():
             problems.append(f"{label}: video file not found: {self.source}")
         if not self.telemetry_path.strip():
-            problems.append(f"{label}: no telemetry CSV is set.")
+            problems.append(f"{label}: no telemetry is set (a CSV file or udp://host:port).")
+        elif is_udp_address(self.telemetry_path):
+            try:
+                parse_udp_address(self.telemetry_path)
+            except ValueError as error:
+                problems.append(f"{label}: telemetry {error}")
+            if self.source.strip() and "://" not in self.source:
+                problems.append(f"{label}: live UDP telemetry needs a stream link, not a video file. "
+                                "Use the flight's telemetry CSV with a recorded video.")
         elif not Path(self.telemetry_path).is_file():
             problems.append(f"{label}: telemetry file not found: {self.telemetry_path}")
         return problems
+
+    def is_live(self) -> bool:
+        """
+        True when telemetry comes over UDP from a ground station, so the video is a live stream too.
+        """
+        return is_udp_address(self.telemetry_path)
+
+
+def port_clashes(feeds: list[FeedConfig]) -> list[str]:
+    """
+    Every UDP port the console listens on (live telemetry, and udp:// video) can only be used once.
+    """
+    users: dict[int, list[str]] = {}
+    for feed in feeds:
+        label = feed.name.strip() or "A feed"
+        for kind, link in (("telemetry", feed.telemetry_path), ("video", feed.source)):
+            port = udp_port(link)
+            if port is not None:
+                users.setdefault(port, []).append(f"{label} {kind}")
+    return [f"UDP port {port} is used by more than one input ({', '.join(names)}). Give each its own port."
+            for port, names in users.items() if len(names) > 1]
+
+
+@dataclass
+class SearchSession:
+    """
+    The search this run belongs to: a name for it, the area being searched, and when it was created.
+    """
+    name: str = ""
+    area: str = ""
+
+    # seconds since the epoch, 0 until the session is first started
+    created: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data) -> "SearchSession":
+        session = cls()
+        if not isinstance(data, dict):
+            return session
+        session.name = str(data.get("name", ""))
+        session.area = str(data.get("area", ""))
+        try:
+            session.created = float(data.get("created", 0) or 0)
+        except (TypeError, ValueError):
+            session.created = 0.0
+        return session
 
 
 @dataclass
@@ -81,9 +175,14 @@ class RavenConfig:
     # up to MAX_FEEDS drone feeds; confidence, sample rate and everything below are shared by all of them
     feeds: list = field(default_factory=lambda: [FeedConfig()])
 
+    # the search session (name and area) this run belongs to
+    session: SearchSession = field(default_factory=SearchSession)
+
     # detection
-    min_confidence: float = 0.5
-    frame_stride: int = 5
+    min_confidence: float = 0.7
+
+    # frames analysed per second of video, between MIN_ANALYSIS_FPS and MAX_ANALYSIS_FPS
+    analysis_fps: float = 1.0
     model_path: str = str(DEFAULT_MODEL_PATH)
 
     # read video files at their real speed, like a live drone (streams always arrive in real time)
@@ -121,8 +220,9 @@ class RavenConfig:
             # settings saved before multiple feeds existed had a single source
             config.feeds = [FeedConfig(source=str(data.get("source", "")),
                                        telemetry_path=str(data.get("telemetry_path", "")))]
+        config.session = SearchSession.from_dict(data.get("session"))
         for f in fields(cls):
-            if f.name == "feeds":
+            if f.name in ("feeds", "session"):
                 continue
             if f.name in data:
                 default = getattr(config, f.name)
@@ -132,6 +232,7 @@ class RavenConfig:
                 else:
                     value = type(default)(value)
                 setattr(config, f.name, value)
+        # presets saved before analysis_fps existed had a frame_stride instead; they keep the 1 fps default
         return config
 
     def save(self, path) -> None:
@@ -163,14 +264,16 @@ class RavenConfig:
             problems.append("Two feeds have the same drone name. Each drone needs its own name.")
         elif len(set(folders)) != len(folders):
             problems.append("Two drone names only differ by punctuation, so their saved frames would mix. Rename one.")
+        problems.extend(port_clashes(enabled))
         if len(self.feeds) > MAX_FEEDS:
             problems.append(f"At most {MAX_FEEDS} feeds can run at once.")
         if not Path(self.model_path).is_file():
             problems.append(f"Model weights not found: {self.model_path}")
         if not 0 < self.min_confidence < 1:
             problems.append("Confidence threshold must be between 0 and 1.")
-        if self.frame_stride < 1:
-            problems.append("Frame sample rate must be at least 1.")
+        if not MIN_ANALYSIS_FPS <= self.analysis_fps <= MAX_ANALYSIS_FPS:
+            problems.append(f"Analysis rate must be between {MIN_ANALYSIS_FPS:g} and {MAX_ANALYSIS_FPS:g} "
+                            "frames per second.")
         if self.discord_enabled and not self.webhook_url.strip():
             problems.append("Discord alerts are on but no webhook URL is set.")
         return problems

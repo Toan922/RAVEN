@@ -3,6 +3,7 @@ Settings tab: everything the operator inputs for a run (drone feeds, detection, 
 keyboard shortcuts, and the button that opens the log panel.
 """
 import os
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -12,13 +13,16 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
-from raven.backend.config import DETECTION_LOG_NAME, MAX_FEEDS, ROOT_DIR, FeedConfig, RavenConfig
+from raven.backend.config import (
+    DETECTION_LOG_NAME, MAX_ANALYSIS_FPS, MAX_FEEDS, MIN_ANALYSIS_FPS, ROOT_DIR, FeedConfig, RavenConfig,
+    SearchSession, is_udp_address, parse_udp_address, stride_for,
+)
 from raven.gui.alerts import drone_colors
 from raven.gui.shortcut_settings import ShortcutSettings
 from raven.gui.theme import ACCENTS, accent_color
 from raven.gui.workers import JobRunner, send_test_alert
 
-# assumed frame rate for the "checks per second" hint until a source has been tested
+# assumed frame rate for the "every N frames" hint until a source has been tested
 ASSUMED_FPS = 30.0
 
 VIDEO_FILTER = "Videos (*.mp4 *.avi *.mov *.mkv *.m4v *.ts);;All files (*)"
@@ -72,7 +76,8 @@ def is_stream_link(source: str) -> bool:
 
 class FeedEditor(QFrame):
     """
-    One drone feed in Settings: on/off, drone name, video or stream link (with Test), and telemetry CSV.
+    One drone feed in Settings: on/off, drone name, video or stream link (with Test), and telemetry: a CSV,
+    or udp://host:port for live telemetry from the ground station (with Test, which listens for a message).
     """
     changed = Signal()
     probed = Signal(dict)      # source details after a successful test
@@ -84,6 +89,7 @@ class FeedEditor(QFrame):
         self.setObjectName("feedCard")
         self._jobs = jobs
         self.fps = None
+        self._locked = False
 
         self.enabled_check = QCheckBox()
         self.enabled_check.setToolTip("Run this feed when Start is pressed")
@@ -101,7 +107,7 @@ class FeedEditor(QFrame):
         self.remove_button.clicked.connect(self.remove_requested)
 
         self.source_edit = QLineEdit()
-        self.source_edit.setPlaceholderText(r"C:\videos\flight.mp4  or  rtsp://host:554/stream")
+        self.source_edit.setPlaceholderText(r"C:\videos\flight.mp4  or  udp://127.0.0.1:5000")
         self.source_edit.editingFinished.connect(self._source_edited)
         self.source_edit.textChanged.connect(self._emit_changed)
         self.browse_button = QPushButton("Browse…")
@@ -111,11 +117,14 @@ class FeedEditor(QFrame):
         self.source_status = _hint()
 
         self.telemetry_edit = QLineEdit()
-        self.telemetry_edit.setPlaceholderText("CSV with t, latitude, longitude columns")
+        self.telemetry_edit.setPlaceholderText("CSV with t, latitude, longitude columns  or  udp://127.0.0.1:5001")
         self.telemetry_edit.editingFinished.connect(self._telemetry_edited)
         self.telemetry_edit.textChanged.connect(self._emit_changed)
         self.browse_telemetry_button = QPushButton("Browse…")
         self.browse_telemetry_button.clicked.connect(self._browse_telemetry)
+        self.test_telemetry_button = QPushButton("Test telemetry")
+        self.test_telemetry_button.setToolTip("Listen for a live telemetry message on the udp:// port (3 s)")
+        self.test_telemetry_button.clicked.connect(self.test_telemetry)
         self.telemetry_status = _hint()
 
         grid = QGridLayout(self)
@@ -129,8 +138,8 @@ class FeedEditor(QFrame):
         grid.addWidget(QLabel("Video / stream link"), 1, 0)
         grid.addWidget(_row(self.source_edit, self.browse_button, self.test_button), 1, 1)
         grid.addWidget(self.source_status, 2, 1)
-        grid.addWidget(QLabel("Telemetry CSV"), 3, 0)
-        grid.addWidget(_row(self.telemetry_edit, self.browse_telemetry_button), 3, 1)
+        grid.addWidget(QLabel("Telemetry"), 3, 0)
+        grid.addWidget(_row(self.telemetry_edit, self.browse_telemetry_button, self.test_telemetry_button), 3, 1)
         grid.addWidget(self.telemetry_status, 4, 1)
 
         self.set_feed(feed)
@@ -162,6 +171,8 @@ class FeedEditor(QFrame):
         for widget in (self.enabled_check, self.name_edit, self.source_edit, self.browse_button, self.test_button,
                        self.telemetry_edit, self.browse_telemetry_button):
             widget.setEnabled(not locked)
+        self._locked = locked
+        self._update_telemetry_button()
         self.remove_button.setEnabled(not locked and can_remove)
 
     def _emit_changed(self, *_):
@@ -248,15 +259,62 @@ class FeedEditor(QFrame):
         self._check_telemetry()
         self.changed.emit()
 
+    def _update_telemetry_button(self):
+        live = is_udp_address(self.telemetry_edit.text())
+        self.test_telemetry_button.setVisible(live)
+        self.browse_telemetry_button.setVisible(not live)
+        self.test_telemetry_button.setEnabled(live and not self._locked)
+
+    def test_telemetry(self):
+        """
+        Listen on the feed's udp:// port for one telemetry message, so the operator knows the ground station is
+        sending before pressing Start.
+        """
+        from raven.backend.telemetry import listen_once
+
+        link = self.telemetry_edit.text().strip()
+        try:
+            address = parse_udp_address(link)
+        except ValueError as error:
+            self.telemetry_status.setText(f"✗ {error}")
+            return
+        self.test_telemetry_button.setEnabled(False)
+        self.telemetry_status.setText(f"Listening on port {address[1]}…")
+
+        def done(row):
+            self._update_telemetry_button()
+            if self.telemetry_edit.text().strip() == link:
+                self.telemetry_status.setText(
+                    f"✓ Receiving telemetry: {row['latitude']:.5f}, {row['longitude']:.5f}")
+            self.log.emit(f"Telemetry test for {self._label()}: receiving on {link}")
+
+        def fail(message):
+            self._update_telemetry_button()
+            if self.telemetry_edit.text().strip() == link:
+                self.telemetry_status.setText(f"✗ {message}")
+            self.log.emit(f"Telemetry test failed for {self._label()}: {message}")
+
+        self._jobs.run(lambda: listen_once(address, timeout=3.0), done, fail)
+
     def _check_telemetry(self):
         """
-        Validate the telemetry CSV right away using the same loader ingest uses.
+        Validate the telemetry CSV right away using the same loader ingest uses. A udp:// link is only
+        checked for its form here; Test telemetry listens for a message.
         """
         from raven.backend.file_ingest import load_telemetry
 
         path = self.telemetry_edit.text().strip()
+        self._update_telemetry_button()
         if not path:
             self.telemetry_status.setText("Needed to geotag this drone's alerts on the map.")
+            return
+        if is_udp_address(path):
+            try:
+                parse_udp_address(path)
+            except ValueError as error:
+                self.telemetry_status.setText(f"✗ {error}")
+            else:
+                self.telemetry_status.setText("Live telemetry link set. Press Test telemetry to check it's arriving.")
             return
         try:
             rows = load_telemetry(path)
@@ -275,12 +333,22 @@ class SettingsTab(QWidget):
     log_toggle_requested = Signal()
     appearance_changed = Signal(str)        # "system", "light" or "dark"
     accent_changed = Signal(str)            # a key of gui.theme.ACCENTS
+    discord_verified_changed = Signal(bool)  # the current webhook passed a test alert this launch
+    session_edited = Signal()               # the search session's name or area was edited (Manage tab)
     log = Signal(str)
 
-    def __init__(self, config: RavenConfig, parent=None):
+    def __init__(self, config: RavenConfig, demo: bool = False, parent=None):
+        """
+        demo: Discord alerts are optional in demo mode; in normal mode they are required (FR-08).
+        """
         super().__init__(parent)
+        self._demo = demo
         self._jobs = JobRunner(self)
-        self._loading = False
+        # the webhook that passed a test alert this launch; any edit needs a new test
+        self._verified_webhook = ""
+        self._session_created = 0.0
+        # no change signals while the form is being built; set_config ends this
+        self._loading = True
         self._running = False
         self.feed_editors: list[FeedEditor] = []
 
@@ -288,16 +356,25 @@ class SettingsTab(QWidget):
         content.setMaximumWidth(860)
         column = QVBoxLayout(content)
         column.setSpacing(14)
-        column.addWidget(self._build_feeds_group())
-        column.addWidget(self._build_detection_group())
-        column.addWidget(self._build_alerts_group())
+        # the search session is part of the settings but shown on the Manage tab, which places session_group
+        self.session_group = self._build_session_group()
+        # the parts only roles that can change settings may edit; Appearance and shortcuts are personal
+        self._role_sections = [self._build_feeds_group(), self._build_detection_group(), self._build_alerts_group()]
+        for section in self._role_sections:
+            column.addWidget(section)
         column.addWidget(self._build_appearance_group())
-        column.addWidget(self._build_advanced_group())
+        advanced = self._build_advanced_group()
+        self._role_sections.append(advanced)
+        column.addWidget(advanced)
         self.shortcut_settings = ShortcutSettings()
         self.shortcut_settings.log.connect(self.log)
         self.shortcuts_section = _collapsible("Keyboard shortcuts", self.shortcut_settings)
         column.addWidget(self.shortcuts_section)
-        column.addWidget(self._build_preset_row())
+        presets = self._build_preset_row()
+        self._role_sections.append(presets)
+        column.addWidget(presets)
+        self.read_only_note = _hint()
+        self.read_only_note.hide()
         column.addStretch(1)
 
         scroll = QScrollArea()
@@ -317,7 +394,8 @@ class SettingsTab(QWidget):
         self.log_button.clicked.connect(lambda: self.log_toggle_requested.emit())
         top = QHBoxLayout()
         top.setContentsMargins(12, 8, 12, 0)
-        top.addWidget(_hint("Settings apply to the next run. Save changes keeps them for the next launch."), 1)
+        self.top_hint = _hint("Settings apply to the next run. Save changes keeps them for the next launch.")
+        top.addWidget(self.top_hint, 1)
         top.addWidget(self.log_button)
 
         outer = QVBoxLayout(self)
@@ -328,6 +406,26 @@ class SettingsTab(QWidget):
         self.set_config(config)
 
     # ------------------------------------------------------------------ building
+
+    def _build_session_group(self) -> QWidget:
+        # the current session's form; the Manage tab puts it at the top of its Search Sessions box
+        group = QWidget()
+        form = QFormLayout(group)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.session_name_edit = QLineEdit()
+        self.session_name_edit.setPlaceholderText("e.g. Cedar Ridge search, 5 Nov")
+        self.session_name_edit.textChanged.connect(self._changed)
+        self.session_name_edit.editingFinished.connect(self.session_edited)
+        form.addRow("Session name", self.session_name_edit)
+        self.session_area_edit = QLineEdit()
+        self.session_area_edit.setPlaceholderText("e.g. North trailhead to the reservoir, grid B2 to B5")
+        self.session_area_edit.textChanged.connect(self._changed)
+        self.session_area_edit.editingFinished.connect(self.session_edited)
+        form.addRow("Search area", self.session_area_edit)
+        self.session_hint = _hint()
+        form.addRow("", self.session_hint)
+        self._session_widgets = [self.session_name_edit, self.session_area_edit]
+        return group
 
     def _build_feeds_group(self) -> QGroupBox:
         group = QGroupBox(f"Drone feeds (up to {MAX_FEEDS})")
@@ -361,13 +459,14 @@ class SettingsTab(QWidget):
         form.addRow("", _hint("Detections below this confidence are ignored. Lower finds more people "
                               "but raises more false alarms."))
 
-        self.stride_spin = QSpinBox()
-        self.stride_spin.setRange(1, 300)
-        self.stride_spin.setPrefix("every ")
-        self.stride_spin.setSuffix(" frame(s)")
-        self.stride_spin.valueChanged.connect(self._changed)
+        self.fps_spin = QDoubleSpinBox()
+        self.fps_spin.setRange(MIN_ANALYSIS_FPS, MAX_ANALYSIS_FPS)
+        self.fps_spin.setSingleStep(0.5)
+        self.fps_spin.setDecimals(1)
+        self.fps_spin.setSuffix(" frame(s)/sec")
+        self.fps_spin.valueChanged.connect(self._changed)
         self.rate_hint = _hint()
-        form.addRow("Frame sample rate", _row(self.stride_spin, self.rate_hint, stretch_first=False))
+        form.addRow("Analysis rate", _row(self.fps_spin, self.rate_hint, stretch_first=False))
 
         self.model_edit = QLineEdit()
         self.model_edit.textChanged.connect(self._changed)
@@ -380,7 +479,7 @@ class SettingsTab(QWidget):
         self.realtime_check.toggled.connect(self._changed)
         form.addRow("", self.realtime_check)
 
-        self._detection_widgets = [self.confidence_slider, self.confidence_spin, self.stride_spin,
+        self._detection_widgets = [self.confidence_slider, self.confidence_spin, self.fps_spin,
                                    self.model_edit, browse_model, self.realtime_check]
         return group
 
@@ -390,6 +489,11 @@ class SettingsTab(QWidget):
 
         self.discord_check = QCheckBox("Send alerts to Discord while running")
         self.discord_check.toggled.connect(self._changed)
+        if not self._demo:
+            # the search team gets every alert on Discord, so it can't be turned off outside demo mode
+            self.discord_check.setText("Send alerts to Discord while running (required)")
+            self.discord_check.setChecked(True)
+            self.discord_check.setEnabled(False)
         form.addRow("", self.discord_check)
 
         self.webhook_edit = QLineEdit()
@@ -401,10 +505,12 @@ class SettingsTab(QWidget):
         show.setCheckable(True)
         show.toggled.connect(lambda on: self.webhook_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
         self.test_alert_button = QPushButton("Send test alert")
-        self.test_alert_button.clicked.connect(self._send_test_alert)
+        self.test_alert_button.clicked.connect(self.send_test_alert)
         form.addRow("Discord webhook", _row(self.webhook_edit, show, self.test_alert_button))
         self.webhook_status = _hint("Loaded from DISCORD_WEBHOOK_URL in .env. Edits here last until the console closes.")
         form.addRow("", self.webhook_status)
+        self.webhook_test_hint = _hint()
+        form.addRow("", self.webhook_test_hint)
 
         self.cooldown_spin = QDoubleSpinBox()
         self.cooldown_spin.setRange(0, 600)
@@ -415,7 +521,7 @@ class SettingsTab(QWidget):
             "Minimum time between two Discord alerts from the same drone (each drone has its own). "
             "The alert list in the console shows every detection."), stretch_first=False))
 
-        self._alert_widgets = [self.discord_check, self.webhook_edit, self.cooldown_spin]
+        self._alert_widgets = [self.webhook_edit, self.cooldown_spin] + ([self.discord_check] if self._demo else [])
         return group
 
     def _build_appearance_group(self) -> QGroupBox:
@@ -611,12 +717,14 @@ class SettingsTab(QWidget):
     def config(self) -> RavenConfig:
         return RavenConfig(
             feeds=[editor.feed() for editor in self.feed_editors],
+            session=SearchSession(name=self.session_name_edit.text().strip(),
+                                  area=self.session_area_edit.text().strip(), created=self._session_created),
             min_confidence=round(self.confidence_spin.value(), 2),
-            frame_stride=self.stride_spin.value(),
+            analysis_fps=round(self.fps_spin.value(), 1),
             model_path=self.model_edit.text().strip(),
             realtime=self.realtime_check.isChecked(),
             alert_cooldown_s=self.cooldown_spin.value(),
-            discord_enabled=self.discord_check.isChecked(),
+            discord_enabled=self.discord_check.isChecked() or not self._demo,
             webhook_url=self.webhook_edit.text().strip(),
             output_dir=self.output_edit.text().strip() or RavenConfig.output_dir,
         )
@@ -627,23 +735,38 @@ class SettingsTab(QWidget):
         """
         self._loading = True
         self._set_feeds(config.feeds or [FeedConfig()])
+        self.session_name_edit.setText(config.session.name)
+        self.session_area_edit.setText(config.session.area)
+        self._session_created = config.session.created
         self.confidence_spin.setValue(config.min_confidence)
-        self.stride_spin.setValue(config.frame_stride)
+        self.fps_spin.setValue(config.analysis_fps)
         self.model_edit.setText(config.model_path)
         self.realtime_check.setChecked(config.realtime)
         self.cooldown_spin.setValue(config.alert_cooldown_s)
-        self.discord_check.setChecked(config.discord_enabled)
+        self.discord_check.setChecked(config.discord_enabled or not self._demo)
         self.webhook_edit.setText(config.webhook_url)
         self.output_edit.setText(config.output_dir)
         self._loading = False
         self._changed()
+
+    def set_read_only(self, read_only: bool, role_label: str = ""):
+        """
+        Lock every run setting for roles that can't change them (Appearance and shortcuts stay open).
+        """
+        for section in self._role_sections:
+            section.setEnabled(not read_only)
+        self.top_hint.setText(
+            f"Your role ({role_label}) can view these settings but not change them. Appearance and shortcuts are "
+            "yours to set." if read_only else
+            "Settings apply to the next run. Save changes keeps them for the next launch.")
 
     def set_running(self, running: bool):
         """
         Lock the inputs that a running ingest depends on. Shortcuts and the log stay usable.
         """
         self._running = running
-        for widget in self._detection_widgets + self._alert_widgets + self._advanced_widgets + self._preset_widgets:
+        for widget in (self._session_widgets + self._detection_widgets + self._alert_widgets + self._advanced_widgets
+                       + self._preset_widgets):
             widget.setEnabled(not running)
         self._update_feed_controls()
 
@@ -655,7 +778,10 @@ class SettingsTab(QWidget):
         fps = tested.fps if tested else ASSUMED_FPS
         note = f" ({tested.feed().name})" if tested and len(self.feed_editors) > 1 else \
             ("" if tested else " (assumed until a source is tested)")
-        self.rate_hint.setText(f"≈ {fps / self.stride_spin.value():.1f} checks/sec at {fps:.0f} fps{note}")
+        stride = stride_for(fps, self.fps_spin.value())
+        self.rate_hint.setText(f"every {stride} frame(s) at {fps:.0f} fps{note}")
+        self._update_session_hint()
+        self._update_webhook_hint()
         # the main window assigns drone colors from the new feeds list, then calls refresh_colors()
         self.config_changed.emit(self.config())
 
@@ -681,7 +807,7 @@ class SettingsTab(QWidget):
 
     # ------------------------------------------------------------------ discord test
 
-    def _send_test_alert(self):
+    def send_test_alert(self):
         url = self.webhook_edit.text().strip()
         if not url:
             self.webhook_status.setText("✗ No webhook URL set.")
@@ -693,13 +819,67 @@ class SettingsTab(QWidget):
             self.test_alert_button.setEnabled(True)
             self.webhook_status.setText(f"✓ {message}. Check the Discord channel.")
             self.log.emit("Sent a Discord test alert")
+            self._set_verified(url)
 
         def fail(message):
             self.test_alert_button.setEnabled(True)
             self.webhook_status.setText(f"✗ {message}")
             self.log.emit(f"Discord test alert failed: {message}")
+            # always report back, so a resume waiting on this test knows it failed
+            self._set_verified("" if url == self._verified_webhook else self._verified_webhook)
 
         self._jobs.run(lambda: send_test_alert(url), done, fail)
+
+    def discord_verified(self) -> bool:
+        """
+        True when the webhook in the form passed a test alert since the console started.
+        """
+        url = self.webhook_edit.text().strip()
+        return bool(url) and url == self._verified_webhook
+
+    def _set_verified(self, url: str):
+        self._verified_webhook = url
+        self._update_webhook_hint()
+        self.discord_verified_changed.emit(self.discord_verified())
+
+    def _update_webhook_hint(self):
+        if not hasattr(self, "webhook_test_hint"):
+            return
+        if self.discord_verified():
+            self.webhook_test_hint.setText("✓ Webhook tested this launch.")
+        elif self.discord_check.isChecked():
+            self.webhook_test_hint.setText("Send a test alert before Start: each launch, and every change "
+                                           "to the webhook, needs one successful test.")
+        else:
+            self.webhook_test_hint.setText("")
+
+    def _update_session_hint(self):
+        if not hasattr(self, "session_hint"):
+            return
+        if not self.session_name_edit.text().strip():
+            self.session_hint.setText("Name the session before Start. The name tags this search and lets it "
+                                      "be resumed after a restart. Changes here save on their own.")
+        elif self._session_created:
+            started = datetime.fromtimestamp(self._session_created).strftime("%d %b %Y, %H:%M")
+            self.session_hint.setText(f"Created {started}.")
+        else:
+            self.session_hint.setText("The session is created when you first press Start.")
+
+    def mark_session_created(self, created: float):
+        self._session_created = created
+        self._update_session_hint()
+
+    def session_created(self) -> float:
+        return self._session_created
+
+    def clear_session(self):
+        """
+        An empty form for a new search session (created when it's first started).
+        """
+        self._session_created = 0.0
+        self.session_name_edit.setText("")
+        self.session_area_edit.setText("")
+        self._update_session_hint()
 
     # ------------------------------------------------------------------ presets
 

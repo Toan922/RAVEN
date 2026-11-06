@@ -217,7 +217,8 @@ class DemoBackend:
                    for f in FLIGHTS],
             model_path=str(DETECTOR_NOTE),
             min_confidence=0.5,
-            frame_stride=3,
+            # the most FR-05 allows, so the demo shows plenty of alerts
+            analysis_fps=2.0,
             # play the flights at their real 30 s, so the Live view looks like a drone feed
             realtime=True,
             output_dir=str(FRAMES_DIR),

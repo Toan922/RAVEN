@@ -114,8 +114,8 @@ class AlertDelegate(QStyledItemDelegate):
         painter.setFont(option.font)
         painter.setPen(palette.color(QPalette.PlaceholderText))
         lines = [
-            f"Video {alert.video_time} · {alert.received:%H:%M:%S}",
-            f"{alert.lat:.5f}, {alert.lon:.5f}" if alert.has_location else "No location",
+            f"Live · {alert.received:%H:%M:%S}" if alert.is_live else f"Video {alert.video_time} · {alert.received:%H:%M:%S}",
+            alert.where if alert.has_location else "No location",
         ]
         y = text_rect.top() + line_h + 4
         metrics = painter.fontMetrics()
@@ -251,6 +251,9 @@ class AlertsSidebar(QWidget):
         clear = QPushButton("Clear list")
         clear.setToolTip("Remove all alerts from the list and map. Restarting the console shows them again from the detection log.")
         clear.clicked.connect(self.clear_requested)
+        self.clear_button = clear
+        # Reviewer and Viewer roles can't change some of this (set_review_allowed)
+        self._can_review = True
 
         # keys come from the shortcut settings and work while the list has focus
         for action_id, status in (("alert_reviewed", "reviewed"), ("alert_dismissed", "dismissed"), ("alert_new", "new")):
@@ -384,6 +387,17 @@ class AlertsSidebar(QWidget):
         # card under the cursor before the mouse button is released
         self.list.scrollTo(index, QAbstractItemView.EnsureVisible)
 
+    def clear_selection(self):
+        """
+        Unselect the current alert (e.g. its map pin was clicked again), without telling the map back.
+        """
+        self._syncing = True
+        try:
+            self.list.selectionModel().clearCurrentIndex()
+            self.list.selectionModel().clearSelection()
+        finally:
+            self._syncing = False
+
     def current_alert(self) -> Alert | None:
         index = self.list.currentIndex()
         return index.data(ALERT_ROLE) if index.isValid() else None
@@ -392,9 +406,19 @@ class AlertsSidebar(QWidget):
         if current.isValid() and not self._syncing:
             self.alert_selected.emit(current.data(ALERT_ROLE).id)
 
+    def set_review_allowed(self, can_review: bool, can_clear: bool):
+        """
+        Grey out the status buttons and Clear list for roles that can't use them.
+        """
+        self._can_review = can_review
+        for button in (self.reviewed_button, self.dismiss_button):
+            button.setEnabled(can_review)
+            button.setToolTip("" if can_review else "Your role can't review or dismiss alerts")
+        self.clear_button.setEnabled(can_clear)
+
     def _set_current_status(self, status: str):
         alert = self.current_alert()
-        if alert is not None:
+        if alert is not None and self._can_review:
             row = self.list.currentIndex().row()
             self.status_changed.emit(alert.id, status)
             # keep a sensible selection if the alert just left the filtered list
@@ -414,7 +438,7 @@ class AlertsSidebar(QWidget):
         menu.addSeparator()
         for status, label in (("new", "Mark new"), ("reviewed", "Mark reviewed"), ("dismissed", "Dismiss")):
             action = QAction(label, menu)
-            action.setEnabled(alert.status != status)
+            action.setEnabled(alert.status != status and self._can_review)
             action.triggered.connect(lambda _=False, s=status: self.status_changed.emit(alert.id, s))
             menu.addAction(action)
         menu.exec(self.list.viewport().mapToGlobal(pos))

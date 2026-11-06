@@ -7,8 +7,11 @@ import json
 import threading
 from pathlib import Path
 
+from raven.backend import vault
+
 # the HumanDetected fields kept in the log, besides the event's id
-LOGGED_FIELDS = ("frame", "frame_index", "time", "telemetry", "bounding_boxes", "drone", "source", "video_time")
+LOGGED_FIELDS = ("frame", "frame_index", "time", "telemetry", "bounding_boxes", "drone", "source", "video_time",
+                 "location", "location_status")
 
 # how many of the newest records read_log returns, so a long-lived log doesn't flood the alert list
 MAX_REPLAYED = 10000
@@ -37,7 +40,8 @@ class DetectionLog:
         """
         Bus handler for HumanDetected. The write is a single short line, so it runs right on the bus thread.
         """
-        line = json.dumps(event_record(event))
+        # one Fernet token per line when the console turned encryption on (raven.backend.vault)
+        line = vault.encode_line(json.dumps(event_record(event)))
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
@@ -60,8 +64,8 @@ def read_log(path, limit=MAX_REPLAYED) -> tuple[list[dict], int]:
             if not line.strip():
                 continue
             try:
-                record = json.loads(line)
-            except ValueError:
+                record = json.loads(vault.decode_line(line))
+            except (ValueError, vault.VaultError):
                 skipped += 1
                 continue
             if isinstance(record, dict) and record.get("id") and record.get("frame"):

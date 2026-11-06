@@ -1,36 +1,44 @@
 """
 Operator profile: the button at the right end of the header and the panel it opens, with who is signed in,
-the drones they're operating (state, battery, flight time) and their account details, partly hidden.
+the drones they're operating (state, battery, flight time; only for roles that fly drones, since reviewers and
+viewers watch every feed) and their account details, partly hidden.
 
-There's no sign-in yet, so the operator is the sample profile in OPERATOR. Swap it for real account data
-once accounts exist.
+The details come from the signed-in account (raven.backend.accounts); set_user switches them when someone else
+signs in.
 """
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QPoint, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QToolButton, QVBoxLayout,
     QWidget,
 )
 
+from raven.backend.accounts import RUN_FEEDS
 from raven.gui.alerts import drone_colors
 from raven.gui.alerts_panel import drone_icon
 from raven.gui.theme import THEMES, themed_icon
 
-# the signed-in operator: (label, value, how it shows while hidden); rows with a hidden form get an eye button
-OPERATOR = {
-    "name": "Albert Ross",
-    "role": "Drone Operator",
-    "account": [
-        ("Operator ID", "RVN-OP-4417-2731", "RVN-OP-••••-2731"),
-        ("Email", "albert.ross@raven-ops.example", "al•••••••••@raven-ops.example"),
-        ("Part 107 certificate", "4823194", "•••3194"),
-        ("Certificate expires", "03/2028", None),
-        ("Unit", "North Texas SAR · Team 2", None),
-    ],
-}
+
+
+def _masked_email(email: str) -> str:
+    name, _, domain = email.partition("@")
+    return (name[:2] + "•" * max(1, len(name) - 2) + ("@" + domain if domain else "")) if email else ""
+
+
+def account_rows(user) -> list[tuple[str, str, str | None]]:
+    """
+    The account info rows for a user: (label, value, how it shows while hidden); hidden rows get an eye button.
+    """
+    rows = [("Username", user.username, None), ("Role", user.role_label, None)]
+    if user.email:
+        rows.append(("Email", user.email, _masked_email(user.email)))
+    if user.unit:
+        rows.append(("Unit", user.unit, None))
+    rows.append(("Account created", datetime.fromtimestamp(user.created).strftime("%b %d, %Y"), None))
+    return rows
 
 # the operator's duty status: key -> (label, color); the header icon carries the same colored dot
 DUTY_STATUSES = {
@@ -166,10 +174,14 @@ class ProfilePanel(QWidget):
     duty_changed = Signal(str)       # a key of DUTY_STATUSES
     logout_requested = Signal()
 
-    def __init__(self, live_view, parent=None):
+    def __init__(self, live_view, user, assignments=None, parent=None):
+        """
+        assignments (manage_tab.DroneAssignments): the panel lists only the drones assigned to the signed-in user.
+        """
         super().__init__(parent, Qt.Popup)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.live = live_view
+        self.assignments = assignments
         self._rows: dict[str, DroneRow] = {}
         self.signed_in = datetime.now()
 
@@ -181,18 +193,17 @@ class ProfilePanel(QWidget):
         self.avatar.setObjectName("profileAvatar")
         self.avatar.setFixedSize(56, 56)
         self.avatar.setAlignment(Qt.AlignCenter)
-        name = QLabel(OPERATOR["name"])
-        name.setObjectName("profileName")
-        role = QLabel(OPERATOR["role"])
-        role.setObjectName("hint")
+        self.name_label = QLabel()
+        self.name_label.setObjectName("profileName")
+        self.role_label = QLabel()
+        self.role_label.setObjectName("hint")
         # duty status, remembered between launches
         self.duty_combo = QComboBox()
         self.duty_combo.setObjectName("dutyCombo")
         self.duty_combo.setToolTip("Your status")
         for key, (label, color) in DUTY_STATUSES.items():
             self.duty_combo.addItem(_dot(color), label, key)
-        saved = QSettings().value("duty_status", DEFAULT_DUTY)
-        self.duty_combo.setCurrentIndex(max(0, self.duty_combo.findData(saved)))
+        # each account keeps its own status (User.duty); set_user shows it
         self.duty_combo.currentIndexChanged.connect(self._duty_picked)
         self.flying = QLabel()
         self.flying.setObjectName("hint")
@@ -203,16 +214,15 @@ class ProfilePanel(QWidget):
 
         who = QVBoxLayout()
         who.setSpacing(2)
-        who.addWidget(name)
-        who.addWidget(role)
+        who.addWidget(self.name_label)
+        who.addWidget(self.role_label)
         who.addSpacing(2)
         who.addLayout(duty_row)
 
-        # there's no sign-in yet, so logging out only notes that in the log
         self.logout_button = QPushButton("Log out")
         self.logout_button.setObjectName("logoutButton")
         self.logout_button.setCursor(Qt.PointingHandCursor)
-        self.logout_button.setToolTip("Sign out of the console (not available yet: there's no sign-in)")
+        self.logout_button.setToolTip("Sign out and lock the console; feeds keep running until the next person signs in")
         self.logout_button.clicked.connect(self._logout)
 
         top = QHBoxLayout()
@@ -225,18 +235,74 @@ class ProfilePanel(QWidget):
         self.drones_heading = _heading("Drones being operated")
         self.drones_box = QVBoxLayout()
         self.drones_box.setSpacing(6)
-        self.no_drones = QLabel("No drone feeds are turned on. Add one in Settings > Drone feeds.")
+        self.no_drones = QLabel("No drones are assigned to you. An administrator assigns them in Manage > Drones.")
         self.no_drones.setObjectName("hint")
         self.no_drones.setWordWrap(True)
         self.drones_box.addWidget(self.no_drones)
 
-        # ---- account info
-        account = QGridLayout()
+        # ---- account info, filled by set_user
+        self.account_holder = QWidget()
+        self._secrets: list[tuple[QLabel, QToolButton, str, str]] = []
+        self.signed_in_label = QLabel()
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        layout.addLayout(top)
+        # hidden for roles that don't fly drones (set_user)
+        self.drones_section = QWidget()
+        section = QVBoxLayout(self.drones_section)
+        section.setContentsMargins(0, 0, 0, 0)
+        section.setSpacing(10)
+        section.addWidget(_line())
+        section.addWidget(self.drones_heading)
+        section.addLayout(self.drones_box)
+        layout.addWidget(self.drones_section)
+        layout.addWidget(_line())
+        layout.addWidget(_heading("Account info"))
+        layout.addWidget(self.account_holder)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+        self.setFixedWidth(400)
+
+        # flight times and batteries move while the panel is open
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self.refresh)
+        self.hidden_at = 0.0
+        self.set_user(user)
+
+    def set_user(self, user):
+        """
+        Show a newly signed-in account.
+        """
+        self.user = user
+        self.signed_in = datetime.now()
+        self.name_label.setText(user.name)
+        self.role_label.setText(user.role_label)
+        self.duty_combo.blockSignals(True)
+        self.duty_combo.setCurrentIndex(max(0, self.duty_combo.findData(getattr(user, "duty", DEFAULT_DUTY))))
+        self.duty_combo.blockSignals(False)
+        self.drones_section.setVisible(self.flies_drones())
+
+        # rebuild the account rows for this user
+        old = self.account_holder.layout()
+        if old is not None:
+            while old.count():
+                item = old.takeAt(0)
+                if item.widget() is not None and item.widget() is not self.signed_in_label:
+                    item.widget().deleteLater()
+            QWidget().setLayout(old)  # hands the old layout to a throwaway widget so a new one can be set
+        account = QGridLayout(self.account_holder)
+        account.setContentsMargins(0, 0, 0, 0)
         account.setHorizontalSpacing(16)
         account.setVerticalSpacing(5)
         account.setColumnStretch(1, 1)
-        self._secrets: list[tuple[QLabel, QToolButton, str, str]] = []
-        for row, (label, value, hidden) in enumerate(OPERATOR["account"]):
+        self._secrets = []
+        rows = account_rows(user)
+        for row, (label, value, hidden) in enumerate(rows):
             key = QLabel(label)
             key.setObjectName("hint")
             shown = QLabel(hidden or value)
@@ -253,37 +319,17 @@ class ProfilePanel(QWidget):
                 eye.toggled.connect(lambda _=False, i=len(self._secrets): self._show_secret(i))
                 account.addWidget(eye, row, 2)
                 self._secrets.append((shown, eye, value, hidden))
-        self.signed_in_label = QLabel()
-        account.addWidget(_hint_label("Signed in"), len(OPERATOR["account"]), 0)
-        account.addWidget(self.signed_in_label, len(OPERATOR["account"]), 1)
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-        layout.addLayout(top)
-        layout.addWidget(_line())
-        layout.addWidget(self.drones_heading)
-        layout.addLayout(self.drones_box)
-        layout.addWidget(_line())
-        layout.addWidget(_heading("Account info"))
-        layout.addLayout(account)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(card)
-        self.setFixedWidth(400)
-
-        # flight times and batteries move while the panel is open
-        self._timer = QTimer(self)
-        self._timer.setInterval(500)
-        self._timer.timeout.connect(self.refresh)
-        self.hidden_at = 0.0
+        account.addWidget(_hint_label("Signed in"), len(rows), 0)
+        account.addWidget(self.signed_in_label, len(rows), 1)
+        if hasattr(self, "_theme"):
+            self.set_theme(self._theme)
 
     def duty(self) -> str:
         return self.duty_combo.currentData()
 
     def _duty_picked(self, _index: int):
-        QSettings().setValue("duty_status", self.duty())
+        # the main window saves it to the account (duty_changed)
+        self.user.duty = self.duty()
         self.duty_changed.emit(self.duty())
 
     def _logout(self):
@@ -308,8 +354,20 @@ class ProfilePanel(QWidget):
         for _label, eye, _value, _hidden in self._secrets:
             eye.setChecked(False)
 
-    def refresh(self):
+    def flies_drones(self) -> bool:
+        """
+        Administrators and drone operators get drones assigned; reviewers and viewers watch all of them instead.
+        """
+        return self.user.can(RUN_FEEDS)
+
+    def _my_drones(self) -> list[str]:
         names = self.live.drone_names()
+        if self.assignments is None:   # scripts and tests without assignments: every drone
+            return names
+        return [name for name in names if self.assignments.get(name) == self.user.username]
+
+    def refresh(self):
+        names = self._my_drones()
         for name in list(self._rows):
             if name not in names:
                 self._rows.pop(name).deleteLater()
@@ -321,9 +379,10 @@ class ProfilePanel(QWidget):
             row.show_status(*self.live.status(name))
         self.no_drones.setVisible(not names)
 
-        flying = sum(1 for name in names if self.live.status(name)[0] in ("starting", "running"))
+        counted = names if self.flies_drones() else self.live.drone_names()   # reviewers: every feed
+        flying = sum(1 for name in counted if self.live.status(name)[0] in ("starting", "running"))
         self.drones_heading.setText(f"Drones being operated ({len(names)})")
-        self.flying.setText(f"{flying} of {len(names)} flying")
+        self.flying.setText(f"{flying} of {len(counted)} flying")
         self.signed_in_label.setText(f"{self.signed_in:%b %d, %H:%M}")
 
     def open_under(self, button: QWidget):
@@ -364,12 +423,12 @@ class ProfileButton(QToolButton):
     """
     opened = Signal()
 
-    def __init__(self, live_view, parent=None):
+    def __init__(self, live_view, user, assignments=None, parent=None):
         super().__init__(parent)
         self.setObjectName("themeButton")  # same look as the light/dark toggle beside it
         self.setIconSize(QSize(24, 24))
         self.setCursor(Qt.PointingHandCursor)
-        self.panel = ProfilePanel(live_view, self)
+        self.panel = ProfilePanel(live_view, user, assignments, self)
         self.panel.duty_changed.connect(lambda _: self._draw_icon())
         self.clicked.connect(self._toggle)
         self._theme = "light"
@@ -403,4 +462,4 @@ class ProfileButton(QToolButton):
         painter.drawEllipse(32, 32, 13, 13)
         painter.end()
         self.setIcon(QIcon(pixmap))
-        self.setToolTip(f"{OPERATOR['name']} ({label}): profile and drones")
+        self.setToolTip(f"{self.panel.user.name} ({label}): profile and drones")

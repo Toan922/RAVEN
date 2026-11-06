@@ -47,6 +47,9 @@ class FeedRow:
     def __init__(self, index: int, name: str, browse):
         self.index = index  # position in the Settings feeds list
         self.name = name
+        # a feed or analysis problem shown in amber until it clears ("" for none)
+        self.warning = ""
+        self._running = False
         # the last probed source details, kept while the source stays the same
         self.info: dict | None = None
         self.info_source = ""
@@ -106,7 +109,9 @@ class FeedRow:
 
     def set_running(self, running: bool):
         self.browse_button.setEnabled(not running)
+        self._running = running
         if running:
+            self.warning = ""
             self.progress.setRange(0, 0)  # busy until the first progress report
             self.progress.setFormat("Starting…")
             self.state_light.set_state("amber", "Loading telemetry, source and model", "Starting")
@@ -116,10 +121,17 @@ class FeedRow:
             self.stats_label.setText("Read 0 · checked 0 · people 0 · alerts 0")
             return
 
-        self.state_light.set_state("green", "Running", "Running")
-        self.stats_label.setText(
-            f"Read {stats['frames_read']:,} · checked {stats['frames_checked']:,} · "
-            f"people {stats['detections']:,} · alerts {stats['events_published']:,}")
+        if self.warning:
+            self.state_light.set_state("amber", self.warning, "Warning")
+        else:
+            self.state_light.set_state("green", "Running", "Running")
+        text = (f"Read {stats['frames_read']:,} · checked {stats['frames_checked']:,} · "
+                f"people {stats['detections']:,} · alerts {stats['events_published']:,}")
+        if stats.get("inference_p90_ms"):
+            text += f" · p90 {stats['inference_p90_ms']:.0f} ms"
+        if stats.get("lag_s", 0) >= 0.5:
+            text += f" · lag {stats['lag_s']:.1f} s"
+        self.stats_label.setText(text)
 
         total = stats["total_frames"]
         elapsed = _clock(stats["time"])
@@ -132,7 +144,19 @@ class FeedRow:
             self.progress.setRange(0, 0)
             self.progress.setFormat(f"Live · {elapsed}")
 
+    def set_warning(self, text: str):
+        """
+        Show a feed or analysis problem in amber on this feed's light (text "" clears it).
+        """
+        self.warning = text
+        if text:
+            self.state_light.set_state("amber", text, "Warning")
+        elif self._running and self.state_light.state == "amber" and self.state_light.text().endswith("Warning"):
+            self.state_light.set_state("green", "Running", "Running")
+
     def set_finished(self, message: str, ok: bool):
+        self._running = False
+        self.warning = ""
         self.progress.setRange(0, 1000)
         self.progress.setFormat(message)
         self.state_light.set_state("gray" if ok else "red", message, message)
@@ -174,6 +198,8 @@ class VideoBar(QFrame):
         self.stop_button = QPushButton(" Stop")
         self.stop_button.setToolTip("Stop every running feed")
         self.stop_button.clicked.connect(self.stop_requested)
+        # roles that can't run feeds (Reviewer, Viewer) see the buttons greyed out
+        self._can_run = True
         self.stop_button.setEnabled(False)
         self.edit_button = QPushButton("Edit feeds…")
         self.edit_button.setToolTip("Add, remove or rename drone feeds in Settings")
@@ -247,7 +273,7 @@ class VideoBar(QFrame):
             for widget in row.widgets():
                 widget.deleteLater()
         self.no_feeds.setVisible(not self.rows)
-        self.start_button.setEnabled(bool(self.rows) and not self._running)
+        self.start_button.setEnabled(bool(self.rows) and not self._running and self._can_run)
 
     def set_source_info(self, name: str, source: str, info: dict):
         row = self.rows.get(name)
@@ -255,10 +281,17 @@ class VideoBar(QFrame):
             row.info, row.info_source = info, source
             row.set_source(source, info)
 
+    def set_allowed(self, can_run: bool):
+        self._can_run = can_run
+        tip = "" if can_run else " (your role can't start or stop feeds)"
+        self.start_button.setToolTip("Start every feed that's turned on" + tip)
+        self.stop_button.setToolTip("Stop every running feed" + tip)
+        self.set_running(self._running)
+
     def set_running(self, running: bool, names=()):
         self._running = running
-        self.start_button.setEnabled(not running and bool(self.rows))
-        self.stop_button.setEnabled(running)
+        self.start_button.setEnabled(not running and bool(self.rows) and self._can_run)
+        self.stop_button.setEnabled(running and self._can_run)
         self.edit_button.setEnabled(not running)
         for name in names:
             if name in self.rows:
@@ -275,6 +308,10 @@ class VideoBar(QFrame):
     def set_finished(self, name: str, message: str, ok: bool):
         if name in self.rows:
             self.rows[name].set_finished(message, ok)
+
+    def set_warning(self, name: str, text: str):
+        if name in self.rows:
+            self.rows[name].set_warning(text)
 
     def set_stopping(self):
         self.stop_button.setEnabled(False)

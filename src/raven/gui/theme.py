@@ -65,6 +65,19 @@ QLabel#demoPill {{
     background: #f5a524; color: #2b1d00; border-radius: 11px; padding: 3px 12px; font-weight: 600;
 }}
 QLabel#hint {{ color: {muted}; }}
+QFrame#signInCard {{ background: {base}; border: 1px solid {border}; border-radius: 12px; }}
+QLabel#signInTitle {{ font-size: 18px; font-weight: 600; }}
+QLabel#signInError {{ color: #e5484d; }}
+QWidget#lockScreen {{ background: {window}; }}
+QPushButton#signInButton {{
+    background: {highlight}; color: #ffffff; border: none; border-radius: 6px; padding: 8px 16px; font-weight: 600;
+}}
+QLabel#warningNotice {{ background: #f5a524; color: #2b1d00; padding: 6px 14px; font-weight: 600; }}
+QLabel#warningPill {{ background: #f5a524; color: #2b1d00; border-radius: 8px; padding: 1px 8px; font-weight: 600; }}
+QLabel#sessionName {{ color: {text}; font-weight: 600; }}
+QLabel#sessionState {{ border-radius: 11px; padding: 3px 12px; font-weight: 600; border: 1px solid {border}; color: {muted}; }}
+QLabel#sessionState[state="ready"] {{ background: #1f9d55; color: #ffffff; border-color: #1f9d55; }}
+QLabel#sessionState[state="running"] {{ background: {highlight}; color: #ffffff; border-color: {highlight}; }}
 QToolButton#advancedToggle {{ border: none; font-weight: bold; }}
 QFrame#videoBar {{ background: {window}; border: none; }}
 QWidget#alertsStrip {{ background: {window}; }}
@@ -73,6 +86,9 @@ QPushButton#subTab {{
     background: {button}; color: {text}; border: 1px solid {border}; padding: 6px 18px; font-weight: 600;
 }}
 QPushButton#subTab[position="first"] {{ border-top-left-radius: 6px; border-bottom-left-radius: 6px; }}
+QPushButton#subTab[position="only"] {{ border-radius: 6px; }}
+QTableWidget#accountsTable::item {{ padding: 4px 12px 4px 8px; }}
+QTableWidget#accountsTable QHeaderView::section {{ padding: 4px 12px 4px 8px; border: none; border-bottom: 1px solid palette(mid); background: palette(button); font-weight: 600; }}
 QPushButton#subTab[position="last"] {{ border-top-right-radius: 6px; border-bottom-right-radius: 6px; border-left: none; }}
 QPushButton#subTab:hover {{ background: {alt}; }}
 QPushButton#subTab:checked {{ background: {highlight}; color: #ffffff; border-color: {highlight}; }}

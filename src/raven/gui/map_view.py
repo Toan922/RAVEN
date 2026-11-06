@@ -45,6 +45,7 @@ class _Bridge(QObject):
     """
     ready = Signal()
     marker_clicked = Signal(str)
+    marker_unselected = Signal(str)
 
     @Slot()
     def pageReady(self):
@@ -53,6 +54,10 @@ class _Bridge(QObject):
     @Slot(str)
     def markerClicked(self, alert_id):
         self.marker_clicked.emit(alert_id)
+
+    @Slot(str)
+    def markerUnselected(self, alert_id):
+        self.marker_unselected.emit(alert_id)
 
 
 class _LinkCatcher(QWebEnginePage):
@@ -98,6 +103,7 @@ class _MapPage(QWebEnginePage):
 
 class MapView(QWebEngineView):
     marker_clicked = Signal(str)
+    marker_unselected = Signal(str)  # the selected pin was clicked again
     link_requested = Signal(QUrl)
     log = Signal(str)
 
@@ -119,6 +125,7 @@ class MapView(QWebEngineView):
         self._bridge = _Bridge(self)
         self._bridge.ready.connect(self._on_ready)
         self._bridge.marker_clicked.connect(self.marker_clicked)
+        self._bridge.marker_unselected.connect(self.marker_unselected)
         self._channel = QWebChannel(self.page())
         self._channel.registerObject("bridge", self._bridge)
         self.page().setWebChannel(self._channel)

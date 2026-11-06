@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QStyleOptionSlider, QToolButton, QVBoxLayout, QWidget,
 )
 
-from raven.gui.alerts import STATUS_COLORS, Alert, AlertModel
+from raven.gui.alerts import STATUS_COLORS, Alert, AlertModel, load_frame
 from raven.gui.alerts_panel import STRIP_WIDTH, AlertsSidebar
 from raven.gui.elided_label import ElidedLabel
 from raven.gui.live_view import LiveView
@@ -517,11 +517,31 @@ class FeedTab(QWidget):
         model.modelReset.connect(self._on_model_reset)
 
         self._update_details()
+        self._review_allowed = True
         self.set_subtab(self.LIVE)
 
     # ------------------------------------------------------------------ subtabs
 
+    def set_review_allowed(self, allowed: bool):
+        """
+        Roles without footage review (Viewer) get the Live subtab only.
+        """
+        self._review_allowed = allowed
+        self.review_tab_button.setVisible(allowed)
+        self.live.set_review_allowed(allowed)
+        self.live_tab_button.setProperty("position", "first" if allowed else "only")
+        self.live_tab_button.style().unpolish(self.live_tab_button)
+        self.live_tab_button.style().polish(self.live_tab_button)
+        if not allowed:
+            self.player.pause()
+            self.set_subtab(self.LIVE)
+
+    def review_allowed(self) -> bool:
+        return self._review_allowed
+
     def set_subtab(self, index: int):
+        if index == self.REVIEW and not getattr(self, "_review_allowed", True):
+            index = self.LIVE
         if index != self.REVIEW:
             self.player.pause()
         self.views.setCurrentIndex(index)
@@ -533,8 +553,15 @@ class FeedTab(QWidget):
 
     def review(self, alert_id: str):
         """
-        Open an alert's footage and switch to the Review subtab.
+        Open an alert's footage and switch to the Review subtab (for a role without Review: that alert's drone
+        on the Live subtab).
         """
+        if not self._review_allowed:
+            alert = self.model.get(alert_id)
+            if alert is not None:
+                self.live.select(alert.drone)
+            self.set_subtab(self.LIVE)
+            return
         self.open_alert(alert_id)
         self.set_subtab(self.REVIEW)
 
@@ -568,7 +595,7 @@ class FeedTab(QWidget):
 
     def open_alert(self, alert_id: str):
         alert = self.model.get(alert_id)
-        if alert is None:
+        if alert is None or not self._review_allowed:
             return
         self._alert_id = alert_id
         self.sidebar.select_alert(alert_id)
@@ -583,7 +610,7 @@ class FeedTab(QWidget):
             if footage is not None:
                 reason = f"OpenCV couldn't open {footage}. Showing the saved frame."
             self._frame_to_alert = {}
-            image = QImage(alert.frame_path)
+            image = load_frame(alert.frame_path)
             self.player.show_still(None if image.isNull() else image, alert.boxes, reason)
             self.log.emit(f"Feed: {reason}")
         self._update_details()
@@ -646,11 +673,11 @@ class FeedTab(QWidget):
         self.alert_dot.setText(f'<span style="color:{alert.drone_color}; font-size:18px">●</span>')
         self.alert_dot.show()
         self.alert_title.setText(f"{alert.drone} · {alert.title}")
-        where = f"{alert.lat:.5f}, {alert.lon:.5f}" if alert.has_location else "no coordinates"
+        where = alert.where if alert.has_location else "no coordinates"
         source = Path(alert.source).name if alert.source and "://" not in alert.source else (alert.source or alert.video_name)
         self.alert_details.setText(
-            f"Video {alert.video_time} · frame {alert.frame_index if alert.frame_index is not None else '?'} · "
-            f"drone at {where} · received {alert.received:%H:%M:%S} · {source}")
+            f"{alert.when.capitalize()} · frame {alert.frame_index if alert.frame_index is not None else '?'} · "
+            f"{'person' if alert.location_status == 'estimated' else 'drone'} at {where} · received {alert.received:%H:%M:%S} · {source}")
         self.status_pill.setText(f" {alert.status.upper()} ")
         self.status_pill.setStyleSheet(f"background:{STATUS_COLORS[alert.status]}; color:white; border-radius:8px;"
                                        "font-weight:bold; padding:1px 6px;")

@@ -39,6 +39,13 @@ class HumanDetected(BaseEvent):
     # seconds into the video when the frame was read (frame_index / fps), or None when not tracked
     video_time: float | None = None
 
+    # where the person is, see raven.backend.geotag (FR-08, FR-09): {"latitude", "longitude"} or None
+    location: dict[str, float] | None = None
+
+    # how location was found: "estimated" (ground position), "approximate" (the drone's own position) or
+    # "unavailable" (no position data); "" when not geotagged, then telemetry is the drone's position
+    location_status: str = ""
+
 class PipelineStatus(BaseEvent):
     """
     The event representing the status of the detection pipeline.

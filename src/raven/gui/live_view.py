@@ -44,6 +44,7 @@ class LiveView(QWidget):
         self._frames: dict[str, tuple[QImage, dict]] = {}
         self._states: dict[str, str] = {}
         self._messages: dict[str, str] = {}
+        self._warnings: dict[str, str] = {}
 
         # ---- banner: drone dropdown, status pill, what the drone is doing
         self.drone_combo = QComboBox()
@@ -53,12 +54,17 @@ class LiveView(QWidget):
         self.state_pill = QLabel()
         self.details = ElidedLabel()  # changes every frame: cut short rather than widen the Feed tab
         self.details.setObjectName("hint")
+        # a feed or analysis problem for the drone being watched, in amber (red is for LIVE)
+        self.warning_label = QLabel()
+        self.warning_label.setObjectName("warningPill")
+        self.warning_label.hide()
 
         self.banner = QWidget()
         banner_layout = QHBoxLayout(self.banner)
         banner_layout.setContentsMargins(0, 0, 0, 0)
         banner_layout.addWidget(self.drone_combo)
         banner_layout.addWidget(self.state_pill, 0, Qt.AlignVCenter)
+        banner_layout.addWidget(self.warning_label, 0, Qt.AlignVCenter)
         banner_layout.addWidget(self.details, 1)
 
         # ---- video, and the drone's latest alert underneath
@@ -140,6 +146,23 @@ class LiveView(QWidget):
         if name == self.current():
             self._render()
 
+    def set_warning(self, name: str, text: str):
+        """
+        Show (or with text "" clear) a feed or analysis problem for a drone.
+        """
+        if text:
+            self._warnings[name] = text
+        else:
+            self._warnings.pop(name, None)
+        if name == self.current():
+            self._show_warning(name)
+
+    def _show_warning(self, name):
+        text = self._warnings.get(name, "") if name else ""
+        self.warning_label.setText(f"⚠ {text}" if text else "")
+        self.warning_label.setToolTip(text)
+        self.warning_label.setVisible(bool(text))
+
     def on_frame(self, name: str, image: QImage, info: dict):
         self._frames[name] = (image, info)
         if self._states.get(name) != "running":
@@ -158,6 +181,7 @@ class LiveView(QWidget):
         self.state_pill.setStyleSheet(f"background:{color}; color:white; border-radius:8px; font-weight:bold;"
                                       "padding:1px 6px;")
         self.state_pill.setToolTip(self._messages.get(name, "") if name else "")
+        self._show_warning(name)
 
         if not name:
             self.details.setText("No drone feeds are turned on. Add one in Settings.")
@@ -210,8 +234,14 @@ class LiveView(QWidget):
         if alert is None:
             self.latest_label.setText("No alerts from this drone yet.")
         else:
-            self.latest_label.setText(f"Latest alert: {alert.title} at video {alert.video_time} "
+            self.latest_label.setText(f"Latest alert: {alert.title} at {alert.when} "
                                       f"(received {alert.received:%H:%M:%S})")
+
+    def set_review_allowed(self, allowed: bool):
+        """
+        Viewers only watch the live feed: no Review latest alert button.
+        """
+        self.review_button.setVisible(allowed)
 
     def _review_latest(self):
         alert = self._latest_alert()

@@ -87,8 +87,11 @@ def render_boxes(event):
     Returns a PIL Image object.
     """
 
-    # get the image from the event's saved frame and create a draw object for it
-    image = Image.open(event.frame).convert("RGB")
+    # get the image from the event's saved frame and create a draw object for it; the operator console saves
+    # frames encrypted, so they're decrypted in memory here (plain files are read as they are)
+    from raven.backend.vault import read_bytes
+
+    image = Image.open(io.BytesIO(read_bytes(event.frame))).convert("RGB")
     draw = ImageDraw.Draw(image)
 
     for bounding_box in event.bounding_boxes:
@@ -105,10 +108,9 @@ def render_boxes(event):
 def create_discord_alert(event):
     """
     Create a Discord embed message for the given detection event (FR-10.2, NFR-07).
-    Coordinates are in decimal degrees (NFR-06). If the frame has no telemetry, the alert says the location is
-    not available and still sends (FR-09).
-    Not implemented yet: per-person location (FR-08) and the approximate label (FR-09), see docs/TODO.md.
-    The location shown is currently the drone's position.
+    Coordinates are in decimal degrees (NFR-06). The location is the person's estimated ground position when the
+    event has one (FR-08); otherwise the drone's position, labelled approximate, or "not available" when the frame
+    has no telemetry, and the alert still sends (FR-09).
     Returns a discord.Embed object.
     """
     
@@ -122,14 +124,19 @@ def create_discord_alert(event):
         color=discord.Color.red()
     )
 
-    # add the location information to the embed (FR-10.2)
-    if event.telemetry:
-        latitude = event.telemetry["latitude"]
-        longitude = event.telemetry["longitude"]
+    # add the location information to the embed (FR-10.2); events from before geotagging only have the
+    # drone's position, which is approximate
+    status = getattr(event, "location_status", "") or ""
+    location = getattr(event, "location", None)
+    if status != "estimated" or not location:
+        location = event.telemetry if status != "unavailable" else None
+    if location:
+        latitude = location["latitude"]
+        longitude = location["longitude"]
         maps_url = f"https://www.google.com/maps/search/?api=1&query={latitude},{longitude}"
 
         embed.add_field(
-            name="Location",
+            name="Location" if status == "estimated" else "Location: Approximate (drone position)",
             value=f"{latitude:.5f}, {longitude:.5f} [View on Maps]({maps_url})",
             inline=False
         )
