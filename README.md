@@ -82,7 +82,15 @@ Check the feeds (terminal 2): `ffplay udp://127.0.0.1:5000` shows the video and 
 ```bash
 python -m raven.pipeline
 ```
-Reads the stream, runs detection, and posts alerts to the channel in `DISCORD_WEBHOOK_URL`, at most one every 10 s. Feed and detection problems print to the terminal.
+Reads the stream, runs detection, and posts alerts to the channel in `DISCORD_WEBHOOK_URL`, at most one every 10 s. Similar person layouts are suppressed even after the cooldown expires. Feed and detection problems print to the terminal.
+
+### Similar-scene alerts
+
+`backend/scene_similarity.py` compares the detected person boxes with the **last queued alert**. Scenes match when the person count is unchanged and every box has a distinct match with at least 0.5 intersection-over-union (overlap area divided by the area covered by either box). Box ordering and confidence changes do not matter, and small box jitter is tolerated. A changed count or a person moving far enough allows a new alert once the existing 10 s cooldown has passed. Gradual movement is compared with the last alerted positions, so it eventually triggers an update.
+
+Tune `DEFAULT_IOU_THRESHOLD` in `src/raven/backend/scene_similarity.py`: lower values suppress more movement; higher values allow more alerts. After more than `SCENE_RESET_SECONDS` (10 s, in `discord_bot/subscriber.py`) without positive detection events, the next detection is treated as a fresh sighting. Shorter disappearances remain part of the same sighting.
+
+The check runs before an alert is queued, so duplicates avoid box rendering, image encoding, and Discord uploads, including while a failed alert is being retried. YOLO still runs for every sampled frame, and frames with positive detections are still saved and published as detection events. Box positions describe the image layout, not people's identities or ground locations; camera motion or different scenes with similar layouts can affect this check.
 
 **Current status:** detection runs end to end and posts to Discord. Alerts show the drone's position, not the person's, because per-person location isn't built yet. The Detection Log and Operator Console aren't built either. See `docs/TODO.md`.
 

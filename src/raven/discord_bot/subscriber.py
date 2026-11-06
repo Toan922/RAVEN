@@ -4,8 +4,14 @@ import time
 import asyncio
 from PIL import Image, ImageDraw
 
+from raven.backend.scene_similarity import scenes_are_similar
+
 # FR-12: minimum seconds between two alerts, so one sighting doesn't flood the channel
 COOLDOWN_SECONDS = 10
+
+# Allow a fresh alert after this long without any positive detection events.
+# Brief missed detections should not make a stationary group alert again.
+SCENE_RESET_SECONDS = 10
 
 # FR-11.2: seconds to wait before trying a failed alert again
 RETRY_SECONDS = 3
@@ -14,8 +20,8 @@ class DiscordSubscriber:
     """
     Alert Notification subsystem (architecture sections 2.2 and 6): subscribes to HumanDetected on the
     Detection Event Bus and sends alerts to a Discord webhook (FR-11.1, C-03).
-    Keeps track of the Discord webhook, the time of the last alert queued, and the queue of alerts waiting to be sent.
-    Ensures that alerts are not sent too frequently by using a cooldown mechanism (FR-12).
+    Keeps track of the Discord webhook, the last scene queued, and the queue of alerts waiting to be sent.
+    Suppresses similar scenes as well as enforcing the alert cooldown (FR-12).
     Failed alerts are retried until delivered (FR-11.2, NFR-09). The queue is held in memory, so it covers
     network and Discord outages, but alerts still waiting are lost if RAVEN itself stops.
     """
@@ -23,24 +29,40 @@ class DiscordSubscriber:
     def __init__(self, webhook):
         self.webhook = webhook
         self.last_alert_time = None
+        self.last_alert_boxes = None
+        self.last_detection_time = None
         self.alerts = asyncio.Queue()
 
     async def on_human_detected(self, event):
         """
         Bus handler for HumanDetected, published only for detections at or above the threshold (FR-10.1).
-        Checks the cooldown (FR-12) and adds the alert to the queue for deliver_alerts() to send. It never waits
+        Checks scene similarity and the cooldown (FR-12), then queues changed scenes for deliver_alerts(). It never waits
         on Discord, so a slow or failed upload can't hold up the event loop or the pipeline (NFR-05, architecture section 5.2).
         """
+
+        # Empty frames do not publish HumanDetected. A gap in positive events re-arms similarity
+        # checking, so people returning to the same positions can trigger another alert.
+        if self.last_detection_time is not None and event.time - self.last_detection_time > SCENE_RESET_SECONDS:
+            self.last_alert_boxes = None
+        self.last_detection_time = event.time
 
         # check if we should alert based on the cooldown (FR-12)
         if not should_alert(event, self.last_alert_time):
             return
 
+        if self.last_alert_boxes is not None and scenes_are_similar(event.bounding_boxes, self.last_alert_boxes):
+            return
+
         # add the event to the queue, where it is retried until delivered (FR-11.2)
-        await self.alerts.put(event)
+        self.alerts.put_nowait(event)
 
         # start the cooldown when queued, not when sent, or every frame during an outage would queue another alert (FR-12)
         self.last_alert_time = event.time
+        # Keep the last queued scene as the reference. Updating it for skipped events would hide
+        # gradual movement or consume a changed scene while the cooldown is still active.
+        self.last_alert_boxes = [
+            {"box_xyxy": list(box["box_xyxy"])} for box in event.bounding_boxes
+        ]
 
     async def deliver_alerts(self):
         """
