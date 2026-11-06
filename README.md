@@ -12,11 +12,18 @@ cd RAVEN
 ```
 
 **2. Create and activate a virtual environment** (activate it again in every new terminal)
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+- **macOS:**
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  ```
 
+- **Windows:**
+  **Command Prompt / VS Code Terminal:**
+  ```cmd
+  python -m venv .venv
+  .\.venv\Scripts\activate.bat
+  ```
 **3. Install RAVEN and its Python dependencies**
 ```bash
 pip install -e .
