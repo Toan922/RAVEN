@@ -4,8 +4,14 @@ import time
 import asyncio
 from PIL import Image, ImageDraw
 
+from raven.backend.scene_similarity import scenes_are_similar
+
 # FR-12: minimum seconds between two alerts, so one sighting doesn't flood the channel
 COOLDOWN_SECONDS = 10
+
+# Allow a fresh alert after this long without any positive detection events.
+# Brief missed detections should not make a stationary group alert again.
+SCENE_RESET_SECONDS = 10
 
 # FR-11.2: seconds to wait before trying a failed alert again
 RETRY_SECONDS = 3
@@ -14,9 +20,10 @@ class DiscordSubscriber:
     """
     Alert Notification subsystem (architecture sections 2.2 and 6): subscribes to HumanDetected on the
     Detection Event Bus and sends alerts to a Discord webhook (FR-11.1, C-03).
-    Keeps track of the Discord webhook, the time of the last alert queued, and the queue of alerts waiting to be sent.
-    Ensures that alerts are not sent too frequently by using a cooldown mechanism (FR-12). Each drone has its own
-    cooldown (events from a single feed all have drone ""), so one busy drone can't hide another drone's sightings.
+    Keeps track of the Discord webhook, the last alert queued (time and scene), and the queue of alerts waiting to be sent.
+    Ensures that alerts are not sent too frequently by using a cooldown mechanism, and suppresses similar scenes (FR-12).
+    Each drone has its own cooldown and scene state (events from a single feed all have drone ""), so one busy drone
+    can't hide another drone's sightings.
     on_sent(event) and on_error(event, error) are optional callbacks (the operator console's status light uses them).
     Failed alerts are retried until delivered (FR-11.2, NFR-09). The queue is held in memory, so it covers
     network and Discord outages, but alerts still waiting are lost if RAVEN itself stops.
@@ -28,27 +35,45 @@ class DiscordSubscriber:
         self.on_sent = on_sent
         self.on_error = on_error
 
-        # time of the last alert queued, per drone
+        # per drone: time of the last alert queued, boxes of the last alert queued, time of the last positive detection
         self.last_alert_times = {}
+        self.last_alert_boxes = {}
+        self.last_detection_times = {}
         self.alerts = asyncio.Queue()
 
     async def on_human_detected(self, event):
         """
         Bus handler for HumanDetected, published only for detections at or above the threshold (FR-10.1).
-        Checks the cooldown (FR-12) and adds the alert to the queue for deliver_alerts() to send. It never waits
+        Checks scene similarity and the cooldown (FR-12), then queues changed scenes for deliver_alerts(). It never waits
         on Discord, so a slow or failed upload can't hold up the event loop or the pipeline (NFR-05, architecture section 5.2).
         """
+        drone = getattr(event, "drone", "")
+
+        # Empty frames do not publish HumanDetected. A gap in this drone's positive events re-arms similarity
+        # checking, so people returning to the same positions can trigger another alert.
+        last_detection = self.last_detection_times.get(drone)
+        if last_detection is not None and event.time - last_detection > SCENE_RESET_SECONDS:
+            self.last_alert_boxes.pop(drone, None)
+        self.last_detection_times[drone] = event.time
 
         # check if we should alert based on this drone's cooldown (FR-12)
-        drone = getattr(event, "drone", "")
         if not should_alert(event, self.last_alert_times.get(drone), self.cooldown):
             return
 
+        previous_boxes = self.last_alert_boxes.get(drone)
+        if previous_boxes is not None and scenes_are_similar(event.bounding_boxes, previous_boxes):
+            return
+
         # add the event to the queue, where it is retried until delivered (FR-11.2)
-        await self.alerts.put(event)
+        self.alerts.put_nowait(event)
 
         # start the cooldown when queued, not when sent, or every frame during an outage would queue another alert (FR-12)
         self.last_alert_times[drone] = event.time
+        # Keep the last queued scene as the reference. Updating it for skipped events would hide
+        # gradual movement or consume a changed scene while the cooldown is still active.
+        self.last_alert_boxes[drone] = [
+            {"box_xyxy": list(box["box_xyxy"])} for box in event.bounding_boxes
+        ]
 
     async def deliver_alerts(self):
         """
