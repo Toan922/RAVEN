@@ -2,5 +2,12 @@ numpy>=1.24
 pillow>=10.0
 ultralytics>=8.0
 bubus>=1.5.6
-discord.py
-python-dotenv
+opencv-python>=4.8
+discord.py>=2.3
+python-dotenv>=1.0
+# operator console (python -m raven.gui)
+PySide6>=6.6
+# operator console: encrypted data folder, key in the OS credential store, password hashing
+cryptography>=42
+keyring>=25
+argon2-cffi>=23.1
