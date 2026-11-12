@@ -1,5 +1,6 @@
 # Runs the test suite on every push to main and every pull request into main.
 # The job name "tests" is the status check to require in the main branch ruleset.
+# release.yml calls it too (workflow_call), so a release runs exactly the same tests.
 name: CI
 
 on:
@@ -8,6 +9,7 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 # a newer push to the same branch or PR cancels the run still going
 concurrency:

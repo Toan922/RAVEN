@@ -101,6 +101,25 @@ pip install -r requirements-dev.txt   # once: RAVEN plus pytest
 pytest tests/                         # CI runs the same on every push and PR to main
 ```
 
+**Releasing** (once per sprint, [Semantic Versioning](https://semver.org): `vMAJOR.MINOR.PATCH`)
+
+| Bump | When | Example |
+|---|---|---|
+| PATCH | bug fixes only | `0.2.0` → `0.2.1` |
+| MINOR | new features (the usual sprint) | `0.2.1` → `0.3.0` |
+| MAJOR | breaking changes; `1.0.0` is the first version handed to the sponsor as complete | `0.9.0` → `1.0.0` |
+
+1. Open a PR that changes `version` in `pyproject.toml` (e.g. `0.3.0`) and merge it into `main`.
+2. Tag that merge commit on `main` and push the tag:
+   ```bash
+   git switch main && git pull
+   git tag -a v0.3.0 -m "Sprint 3"
+   git push origin v0.3.0
+   ```
+3. `.github/workflows/release.yml` checks the tag is on `main` and matches `pyproject.toml`, runs the tests, and publishes a GitHub Release with notes built from the merged PR titles (so write clear PR titles). A tag with a hyphen, like `v0.3.0-rc.1`, becomes a pre-release (e.g. before a sponsor demo).
+
+To install a release on the ground computer, download its source zip from GitHub's Releases page and follow Getting started from step 2.
+
 ## Layout
 
 ```

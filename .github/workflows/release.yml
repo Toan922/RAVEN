@@ -1,0 +1,57 @@
+# Continuous delivery: pushing a version tag (Semantic Versioning, e.g. v0.2.0) publishes a GitHub Release.
+# The team releases once per sprint; see "Releasing" in the README for the steps.
+#
+#   v1.2.3        a release, marked Latest
+#   v1.3.0-rc.1   a pre-release (anything after a hyphen), never marked Latest
+#
+# A release is published only if the tag is on main, matches the version in pyproject.toml, and the tests pass.
+# GitHub attaches the source zip and tarball; RAVEN runs from that source (it holds the model weights).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, to check the tag is on main
+
+      - name: Tag matches pyproject.toml
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in pyproject.toml. Bump the version in a PR first."
+            exit 1
+          fi
+
+      - name: Tag is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME points at a commit that isn't on main. Release only merged work."
+            exit 1
+          fi
+
+  tests:
+    needs: check-version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # to create the release
+    steps:
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "RAVEN $GITHUB_REF_NAME" --generate-notes $prerelease
