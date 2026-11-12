@@ -38,7 +38,7 @@ class BackgroundBus(ThreadSafeBus):
         self._thread.start()
         super().__init__(None, loop)
 
-        # the bus is created on its own thread, the same way raven.pipeline creates it inside its event loop
+        # the bus is created on its own thread, so it has an event loop of its own
         async def create():
             return EventBus(name=name, parallel_handlers=True)
 

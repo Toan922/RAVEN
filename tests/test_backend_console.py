@@ -20,7 +20,7 @@ from raven.backend.outbox import Outbox
 
 @pytest.fixture(autouse=True)
 def no_encryption():
-    # every test starts and ends with encryption off, like raven.pipeline
+    # every test starts and ends with encryption off
     vault.disable()
     yield
     vault.disable()

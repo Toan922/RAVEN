@@ -17,7 +17,7 @@ from raven.backend.config import FeedConfig, RavenConfig, parse_udp_address, str
 from raven.backend.detection_log import event_record
 from raven.backend.events import HumanDetected, PipelineStatus
 
-# how long stopping Discord waits for queued alerts to send, the same limit raven.pipeline uses at shutdown
+# how long stopping Discord waits for queued alerts to send
 DISCORD_SHUTDOWN_TIMEOUT_S = 5.0
 
 

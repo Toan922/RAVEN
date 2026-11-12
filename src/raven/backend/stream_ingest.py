@@ -1,7 +1,7 @@
 """
 Live ingest for the operator console: a video stream from the ground station with live UDP telemetry.
-Uses the same filters as raven.pipeline (sample_frame with a TelemetryReceiver), so feed_missing,
-feed_interrupted and feed_resumed are reported the same way, and adds what the console needs:
+Uses the frame_sampler filter (sample_frame with a TelemetryReceiver), which reports feed_missing,
+feed_interrupted and feed_resumed, and adds what the console needs:
 several drones at once, progress for the feeds bar, and every frame for the Live view.
 
 The stream is read on its own thread, which keeps only the newest sampled frame: if the model is slower than the

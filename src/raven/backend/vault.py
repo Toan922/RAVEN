@@ -6,7 +6,7 @@ memory when the console shows or sends them.
 The key is made on first use and kept in the operating system's credential store through keyring (on Windows,
 Credential Manager, protected by DPAPI for the signed-in Windows user), never in the data folder itself.
 
-Encryption is off until enable() is called, so raven.pipeline and the tests read and write plain files. Files
+Encryption is off until enable() is called, so the tests read and write plain files. Files
 written before encryption was turned on are still read: anything that isn't a Fernet token is returned as is.
 """
 

@@ -163,7 +163,7 @@ class Alert:
 
     @property
     def seconds(self) -> float:
-        # seconds into the video; events from raven.pipeline's live stream don't track it
+        # seconds into the video; events from live streams don't track it
         return float(self.event.get("video_time") or 0.0)
 
     @property

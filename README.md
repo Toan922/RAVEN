@@ -78,21 +78,21 @@ It sends:
 
 Check the feeds (terminal 2): `ffplay udp://127.0.0.1:5000` shows the video and `nc -ul 5001` prints the telemetry. Close both before running RAVEN, since only one program can listen on each port.
 
-**9. Run RAVEN** (terminal 2, stop with Ctrl+C)
+**9. Run RAVEN** (terminal 2)
 ```bash
-python -m raven.pipeline
+python -m raven.gui
 ```
-Reads the stream, runs detection, and posts alerts to the channel in `DISCORD_WEBHOOK_URL`, at most one every 10 s. Similar person layouts are suppressed even after the cooldown expires. Feed and detection problems print to the terminal.
+In Settings, set a feed's video to `udp://127.0.0.1:5000` and its telemetry to `udp://127.0.0.1:5001`, then start the feeds. The console runs detection and posts alerts to the channel in `DISCORD_WEBHOOK_URL`, at most one every 10 s per drone. Similar person layouts are suppressed even after the cooldown expires. See [Operator console](#operator-console-srcravengui) below.
 
 ### Similar-scene alerts
 
-`backend/scene_similarity.py` compares the detected person boxes with the **last queued alert**. Scenes match when the person count is unchanged and every box has a distinct match with at least 0.5 intersection-over-union (overlap area divided by the area covered by either box). Box ordering and confidence changes do not matter, and small box jitter is tolerated. A changed count or a person moving far enough allows a new alert once the existing 10 s cooldown has passed. Gradual movement is compared with the last alerted positions, so it eventually triggers an update.
+`backend/scene_similarity.py` compares the detected person boxes with **that drone's last queued alert**; each drone is tracked separately. Scenes match when the person count is unchanged and every box has a distinct match with at least 0.5 intersection-over-union (overlap area divided by the area covered by either box). Box ordering and confidence changes do not matter, and small box jitter is tolerated. A changed count or a person moving far enough allows a new alert once the existing 10 s cooldown has passed. Gradual movement is compared with the last alerted positions, so it eventually triggers an update.
 
-Tune `DEFAULT_IOU_THRESHOLD` in `src/raven/backend/scene_similarity.py`: lower values suppress more movement; higher values allow more alerts. After more than `SCENE_RESET_SECONDS` (10 s, in `discord_bot/subscriber.py`) without positive detection events, the next detection is treated as a fresh sighting. Shorter disappearances remain part of the same sighting.
+Tune `DEFAULT_IOU_THRESHOLD` in `src/raven/backend/scene_similarity.py`: lower values suppress more movement; higher values allow more alerts. After more than `SCENE_RESET_SECONDS` (10 s, in `discord_bot/subscriber.py`) without positive detection events from a drone, its next detection is treated as a fresh sighting. Shorter disappearances remain part of the same sighting.
 
 The check runs before an alert is queued, so duplicates avoid box rendering, image encoding, and Discord uploads, including while a failed alert is being retried. YOLO still runs for every sampled frame, and frames with positive detections are still saved and published as detection events. Box positions describe the image layout, not people's identities or ground locations; camera motion or different scenes with similar layouts can affect this check.
 
-**Current status:** detection runs end to end and posts to Discord. Alerts show the drone's position, not the person's, because per-person location isn't built yet. See `docs/TODO.md`. The operator console (below) runs the same detector on recorded flights with a map, alert review and a detection log.
+**Current status:** detection runs end to end and posts to Discord. See `docs/TODO.md`.
 
 **Tests**
 ```bash
@@ -127,7 +127,7 @@ python -m raven.gui --demo       # no model or dataset needed
 
 **Encrypted data.** Everything the console writes to the saved-frames folder (frames, `detections.jsonl`, the Discord outbox) and the accounts file (`runs/accounts.dat`) is encrypted with a key kept in the Windows Credential Manager ("RAVEN operator console"), and decrypted in memory for display and Discord. Files from before encryption are still read. Deleting that credential makes the existing data unreadable.
 
-Inside the console everything goes through RAVEN's Detection Event Bus (bubus), the same events `raven.pipeline` uses: each drone feed publishes `HumanDetected` and `PipelineStatus` events, and the alert list, the Detection Log and Discord alerts subscribe to them. Nothing else needs to be running.
+Inside the console everything goes through RAVEN's Detection Event Bus (bubus), each drone feed publishes `HumanDetected` and `PipelineStatus` events, and the alert list, the Detection Log and Discord alerts subscribe to them. Nothing else needs to be running.
 
 **Demo mode** (`--demo`) generates three 30 s synthetic thermal flights in `runs/demo/` (Drone 1 over Dallas, Drone 2 in the Big Bend desert, Drone 3 in the Piney Woods, each with its own telemetry), and swaps the YOLO model for a simulated detector that marks the warm bodies in that video (hotter people get higher confidence, so the confidence slider visibly changes what's detected). Press **Start**; everything after that (ingest, the event bus, alerts, the detection log, the map, Discord if you turn it on) is the real code path. Each demo launch starts with no alerts. Demo mode saves its settings separately, so they never overwrite your real ones.
 
@@ -154,7 +154,7 @@ The header row has the Map / Feed / Manage / Settings pages (`Ctrl+1`–`4`; Man
 
 Use the model's weights at the default path (`runs/detect/runs/train/yolov8n_raven/weights/best.pt`) or pick others in Settings. The Discord webhook is read from `DISCORD_WEBHOOK_URL` in `.env` (gitignored) and is never written to presets; failed Discord sends are retried, and the Discord light turns amber while retrying. Alerts not yet sent are kept in `discord_outbox.jsonl` and sent at the next launch; quitting with alerts still waiting asks first. The feeds bar shows each feed's detection time (p90) and lag. Every detection is appended to `detections.jsonl` in the saved-frames folder (`runs/ingest/` by default), so earlier alerts reappear after a restart; reviewed/dismissed marks are remembered.
 
-For the live UDP stream from the ground station, set a feed's video to `udp://127.0.0.1:5000` and its telemetry to `udp://127.0.0.1:5001` (the simulator in `raven.sim.ground_station` sends both), or run `python -m raven.pipeline` (Getting started, step 9).
+For the live UDP stream from the ground station, set a feed's video to `udp://127.0.0.1:5000` and its telemetry to `udp://127.0.0.1:5001` (the simulator in `raven.sim.ground_station` sends both; Getting started, step 9).
 
 ## Dataset validation (`validate_dataset.py`)
 
