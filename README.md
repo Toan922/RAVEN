@@ -97,7 +97,8 @@ Matching is one-to-one in both cases, so two people standing together count as t
 
 **Tests**
 ```bash
-python tests/test_curate.py   # or: pip install pytest && pytest
+pip install -r requirements-dev.txt   # once: RAVEN plus pytest
+pytest tests/                         # CI runs the same on every push and PR to main
 ```
 
 ## Layout
