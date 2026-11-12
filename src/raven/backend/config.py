@@ -189,7 +189,7 @@ class RavenConfig:
     realtime: bool = False
 
     # alerts
-    alert_cooldown_s: float = 10.0
+    alert_cooldown_s: float = 2.0
     discord_enabled: bool = False
     webhook_url: str = ""
 

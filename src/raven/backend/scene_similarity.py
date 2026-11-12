@@ -1,8 +1,45 @@
-"""Compare scenes using person boxes, without inspecting or loading frame images."""
+"""
+Tell whether a detection shows people already alerted (FR-12), without inspecting or loading frame images.
+
+- RecentPeople: by each person's estimated ground position (from geotag). Works while the drone moves.
+- scenes_are_similar: by person boxes in the image. The fallback when a frame has no ground positions
+  (no telemetry), since boxes shift with the camera and only match while the drone hovers.
+"""
+
+import math
+
+from raven.backend.geotag import METRES_PER_DEGREE
 
 # Each person's box must overlap a previous box by at least this intersection-over-union.
 # Lower values tolerate more movement; higher values require closer matches.
 DEFAULT_IOU_THRESHOLD = 0.5
+
+# Two ground positions this close are taken as the same person. Covers geotag error and telemetry up to
+# 2 s old (FR-06); people this close together are still told apart by count, since each match is one-to-one.
+SAME_PERSON_RADIUS_M = 15.0
+
+
+def _one_to_one(candidates):
+    """
+    candidates[i] lists the previous items that current item i may be. Return {previous index: current index}
+    pairing as many current items as possible, each previous item at most once.
+    """
+    matched = {}
+
+    def find_match(index, visited):
+        for previous_index in candidates[index]:
+            if previous_index in visited:
+                continue
+            visited.add(previous_index)
+            # Reassign an earlier match if needed, so crowded items are order-independent.
+            if previous_index not in matched or find_match(matched[previous_index], visited):
+                matched[previous_index] = index
+                return True
+        return False
+
+    for index in range(len(candidates)):
+        find_match(index, set())
+    return matched
 
 
 def box_iou(box, previous_box):
@@ -36,17 +73,42 @@ def scenes_are_similar(boxes, previous_boxes, iou_threshold=DEFAULT_IOU_THRESHOL
         ]
         for box in boxes
     ]
-    matched = {}
+    return len(_one_to_one(candidates)) == len(boxes)
 
-    def find_match(index, visited):
-        for previous_index in candidates[index]:
-            if previous_index in visited:
-                continue
-            visited.add(previous_index)
-            # Reassign an earlier match if needed, so crowded boxes are order-independent.
-            if previous_index not in matched or find_match(matched[previous_index], visited):
-                matched[previous_index] = index
-                return True
-        return False
 
-    return all(find_match(index, set()) for index in range(len(boxes)))
+def distance_m(location, other):
+    """Metres between two {"latitude", "longitude"} points (flat-earth approximation, fine within a few km)."""
+    north = (location["latitude"] - other["latitude"]) * METRES_PER_DEGREE
+    east = (location["longitude"] - other["longitude"]) * METRES_PER_DEGREE * math.cos(math.radians(location["latitude"]))
+    return math.hypot(north, east)
+
+
+class RecentPeople:
+    """
+    People already alerted for one drone, by ground position. A person is forgotten once they go unseen for
+    window_s; every sighting restarts their window, so someone in view the whole time is never alerted twice.
+    """
+
+    def __init__(self, window_s, radius_m=SAME_PERSON_RADIUS_M):
+        self.window_s = window_s
+        self.radius_m = radius_m
+        self._people = []   # {"location": {"latitude", "longitude"}, "seen": time last seen}
+
+    def new_people(self, locations, now):
+        """
+        Return the locations that aren't a known person. Known people found in locations are marked seen at now.
+        """
+        self._people = [person for person in self._people if now - person["seen"] <= self.window_s]
+        candidates = [
+            [j for j, person in enumerate(self._people) if distance_m(location, person["location"]) <= self.radius_m]
+            for location in locations
+        ]
+        matched = _one_to_one(candidates)
+        for j in matched:
+            self._people[j]["seen"] = now
+        known = set(matched.values())
+        return [location for i, location in enumerate(locations) if i not in known]
+
+    def remember(self, locations, now):
+        """Add people who were just alerted."""
+        self._people += [{"location": dict(location), "seen": now} for location in locations]

@@ -5,9 +5,13 @@ from types import SimpleNamespace
 
 from raven.discord_bot.subscriber import (
     COOLDOWN_SECONDS,
-    SCENE_RESET_SECONDS,
+    DUPLICATE_WINDOW_SECONDS,
     DiscordSubscriber,
 )
+
+# detections without "location" on their boxes (no telemetry) use the image-box fallback, where FR-12's
+# window is the cooldown
+WINDOW = DUPLICATE_WINDOW_SECONDS
 
 
 def detection(timestamp, positions=(0,), drone=""):
@@ -27,11 +31,11 @@ def queued_times(subscriber):
 def test_continuously_observed_scene_stays_suppressed_after_cooldown():
     async def scenario():
         subscriber = DiscordSubscriber(object())
-        for timestamp in range(3 * COOLDOWN_SECONDS + 1):
+        for timestamp in range(3 * WINDOW + 1):
             await subscriber.on_human_detected(detection(timestamp, (0, 60, 120, 180, 240)))
 
         assert subscriber.last_alert_times[""] == 0
-        assert subscriber.last_detection_times[""] == 3 * COOLDOWN_SECONDS
+        assert subscriber.last_detection_times[""] == 3 * WINDOW
         assert queued_times(subscriber) == [0]
 
     asyncio.run(scenario())
@@ -44,8 +48,8 @@ def test_scene_seen_during_cooldown_can_alert_once_cooldown_expires():
         await subscriber.on_human_detected(detection(1, (100,)))
         assert subscriber.alerts.qsize() == 1
 
-        await subscriber.on_human_detected(detection(COOLDOWN_SECONDS, (100,)))
-        assert queued_times(subscriber) == [0, COOLDOWN_SECONDS]
+        await subscriber.on_human_detected(detection(WINDOW, (100,)))
+        assert queued_times(subscriber) == [0, WINDOW]
 
     asyncio.run(scenario())
 
@@ -67,9 +71,9 @@ def test_changed_person_count_alerts_after_cooldown():
     async def scenario():
         subscriber = DiscordSubscriber(object())
         await subscriber.on_human_detected(detection(0))
-        await subscriber.on_human_detected(detection(COOLDOWN_SECONDS, (0, 60)))
+        await subscriber.on_human_detected(detection(WINDOW, (0, 60)))
 
-        assert queued_times(subscriber) == [0, COOLDOWN_SECONDS]
+        assert queued_times(subscriber) == [0, WINDOW]
 
     asyncio.run(scenario())
 
@@ -78,11 +82,11 @@ def test_quiet_gap_rearms_scene_but_exact_reset_boundary_does_not():
     async def scenario():
         subscriber = DiscordSubscriber(object())
         await subscriber.on_human_detected(detection(0))
-        await subscriber.on_human_detected(detection(SCENE_RESET_SECONDS))
-        await subscriber.on_human_detected(detection(2 * SCENE_RESET_SECONDS))
+        await subscriber.on_human_detected(detection(WINDOW))
+        await subscriber.on_human_detected(detection(2 * WINDOW))
         assert subscriber.alerts.qsize() == 1
 
-        returning_time = 3 * SCENE_RESET_SECONDS + 1
+        returning_time = 3 * WINDOW + 1
         await subscriber.on_human_detected(detection(returning_time))
         assert queued_times(subscriber) == [0, returning_time]
 
@@ -113,9 +117,9 @@ def test_drones_keep_separate_scenes():
         await subscriber.on_human_detected(detection(0, drone="B"))
         assert subscriber.alerts.qsize() == 2
 
-        for timestamp in range(1, 3 * SCENE_RESET_SECONDS + 1):
+        for timestamp in range(1, 3 * WINDOW + 1):
             await subscriber.on_human_detected(detection(timestamp, drone="A"))
-        returning_time = 3 * SCENE_RESET_SECONDS + 1
+        returning_time = 3 * WINDOW + 1
         await subscriber.on_human_detected(detection(returning_time, drone="B"))
         alerts = [subscriber.alerts.get_nowait() for _ in range(subscriber.alerts.qsize())]
         assert [(alert.drone, alert.time) for alert in alerts] == [("A", 0), ("B", 0), ("B", returning_time)]
@@ -134,10 +138,78 @@ def test_queue_alert_sees_only_alerts_that_pass_every_check():
 
     async def scenario():
         subscriber = RecordingSubscriber(object())
-        for timestamp in range(3 * COOLDOWN_SECONDS + 1):
+        for timestamp in range(3 * WINDOW + 1):
             await subscriber.on_human_detected(detection(timestamp))
         assert recorded == [0]
         assert queued_times(subscriber) == [0]
+
+    asyncio.run(scenario())
+
+
+def located(timestamp, people, drone=""):
+    """A detection whose boxes carry ground positions; people is a list of (pixel x, metres north of a start point)."""
+    return SimpleNamespace(
+        time=timestamp,
+        drone=drone,
+        bounding_boxes=[{"box_xyxy": [x, 0, x + 13, 17], "confidence": 0.9,
+                         "location": {"latitude": 32.0 + north / 111_320, "longitude": -96.0}}
+                        for x, north in people],
+    )
+
+
+def test_same_person_alerts_once_while_drone_flies_over():
+    async def scenario():
+        # The box moves ~45 px a frame (drone at 5 m/s), but the ground position only wobbles by a few metres.
+        subscriber = DiscordSubscriber(object())
+        for timestamp in range(14):
+            await subscriber.on_human_detected(located(timestamp, [(20 + 45 * timestamp, (-1) ** timestamp * 3)]))
+        assert queued_times(subscriber) == [0]
+
+    asyncio.run(scenario())
+
+
+def test_new_person_alerts_once_the_short_cooldown_passes():
+    async def scenario():
+        # Person B shows up 1 s after A's alert: held back by the 2 s cooldown, then alerted on the next frame.
+        subscriber = DiscordSubscriber(object())
+        for timestamp in range(6):
+            people = [(300, 0)] + ([(100, 200)] if timestamp >= 1 else [])
+            await subscriber.on_human_detected(located(timestamp, people))
+        assert queued_times(subscriber) == [0, COOLDOWN_SECONDS]
+
+    asyncio.run(scenario())
+
+
+def test_people_standing_together_are_counted_separately():
+    async def scenario():
+        subscriber = DiscordSubscriber(object())
+        await subscriber.on_human_detected(located(0, [(300, 0)]))
+        await subscriber.on_human_detected(located(COOLDOWN_SECONDS, [(300, 0), (320, 3)]))
+        assert queued_times(subscriber) == [0, COOLDOWN_SECONDS]
+
+    asyncio.run(scenario())
+
+
+def test_person_is_forgotten_only_after_the_window_unseen():
+    async def scenario():
+        subscriber = DiscordSubscriber(object())
+        await subscriber.on_human_detected(located(0, [(300, 0)]))
+        await subscriber.on_human_detected(located(WINDOW, [(300, 0)]))           # seen again: window restarts
+        await subscriber.on_human_detected(located(2 * WINDOW, [(300, 0)]))       # still within it
+        returning_time = 3 * WINDOW + 1                                           # unseen for more than the window
+        await subscriber.on_human_detected(located(returning_time, [(300, 0)]))
+        assert queued_times(subscriber) == [0, returning_time]
+
+    asyncio.run(scenario())
+
+
+def test_frame_without_ground_positions_falls_back_to_the_window():
+    async def scenario():
+        subscriber = DiscordSubscriber(object())
+        await subscriber.on_human_detected(located(0, [(300, 0)]))
+        await subscriber.on_human_detected(detection(COOLDOWN_SECONDS, (100,)))   # no telemetry: no "location"
+        await subscriber.on_human_detected(detection(WINDOW, (100,)))
+        assert queued_times(subscriber) == [0, WINDOW]
 
     asyncio.run(scenario())
 
@@ -151,4 +223,9 @@ if __name__ == "__main__":
     test_pending_delivery_does_not_accumulate_duplicate_alerts()
     test_drones_keep_separate_scenes()
     test_queue_alert_sees_only_alerts_that_pass_every_check()
+    test_same_person_alerts_once_while_drone_flies_over()
+    test_new_person_alerts_once_the_short_cooldown_passes()
+    test_people_standing_together_are_counted_separately()
+    test_person_is_forgotten_only_after_the_window_unseen()
+    test_frame_without_ground_positions_falls_back_to_the_window()
     print("Discord subscriber tests passed")

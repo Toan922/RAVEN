@@ -519,6 +519,7 @@ class SettingsTab(QWidget):
         self.cooldown_spin.valueChanged.connect(self._changed)
         form.addRow("Discord cooldown", _row(self.cooldown_spin, _hint(
             "Minimum time between two Discord alerts from the same drone (each drone has its own). "
+            "People already alerted aren't alerted again while in view; without telemetry, at least 10 s apply. "
             "The alert list in the console shows every detection."), stretch_first=False))
 
         self._alert_widgets = [self.webhook_edit, self.cooldown_spin] + ([self.discord_check] if self._demo else [])

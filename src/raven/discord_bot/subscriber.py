@@ -4,14 +4,15 @@ import time
 import asyncio
 from PIL import Image, ImageDraw
 
-from raven.backend.scene_similarity import scenes_are_similar
+from raven.backend.scene_similarity import RecentPeople, scenes_are_similar
 
-# FR-12: minimum seconds between two alerts, so one sighting doesn't flood the channel
-COOLDOWN_SECONDS = 10
+# FR-12: a person already alerted isn't alerted again while they stay in view; they're forgotten once unseen
+# for this long. Without ground positions (no telemetry) it's also the minimum time between two alerts.
+DUPLICATE_WINDOW_SECONDS = 10
 
-# Allow a fresh alert after this long without any positive detection events.
-# Brief missed detections should not make a stationary group alert again.
-SCENE_RESET_SECONDS = 10
+# default minimum seconds between two alerts from one drone when people can be told apart by ground position:
+# only protects the Discord channel from bursts, so a new person waits at most this long (NFR-03: 5 s)
+COOLDOWN_SECONDS = 2
 
 # FR-11.2: seconds to wait before trying a failed alert again
 RETRY_SECONDS = 3
@@ -20,9 +21,10 @@ class DiscordSubscriber:
     """
     Alert Notification subsystem (architecture sections 2.2 and 6): subscribes to HumanDetected on the
     Detection Event Bus and sends alerts to a Discord webhook (FR-11.1, C-03).
-    Keeps track of the Discord webhook, the last alert queued (time and scene), and the queue of alerts waiting to be sent.
-    Ensures that alerts are not sent too frequently by using a cooldown mechanism, and suppresses similar scenes (FR-12).
-    Each drone has its own cooldown and scene state (events from a single feed all have drone ""), so one busy drone
+    Keeps track of the Discord webhook, who was already alerted, and the queue of alerts waiting to be sent.
+    Suppresses duplicate alerts for people already alerted (FR-12): by ground position when geotag estimated one
+    for every person, otherwise by comparing person boxes with the last alert, behind a DUPLICATE_WINDOW_SECONDS
+    cooldown. Each drone has its own state (events from a single feed all have drone ""), so one busy drone
     can't hide another drone's sightings.
     on_sent(event) and on_error(event, error) are optional callbacks (the operator console's status light uses them).
     Failed alerts are retried until delivered (FR-11.2, NFR-09). The queue is held in memory, so it covers
@@ -35,33 +37,38 @@ class DiscordSubscriber:
         self.on_sent = on_sent
         self.on_error = on_error
 
-        # per drone: time of the last alert queued, boxes of the last alert queued, time of the last positive detection
+        # per drone: time of the last alert queued, boxes of the last alert queued, time of the last positive
+        # detection, and the people already alerted (RecentPeople)
         self.last_alert_times = {}
         self.last_alert_boxes = {}
         self.last_detection_times = {}
+        self.recent_people = {}
         self.alerts = asyncio.Queue()
 
     async def on_human_detected(self, event):
         """
         Bus handler for HumanDetected, published only for detections at or above the threshold (FR-10.1).
-        Checks scene similarity and the cooldown (FR-12), then queues changed scenes for deliver_alerts(). It never waits
+        Queues an alert for deliver_alerts() when the frame shows someone not yet alerted (FR-12). It never waits
         on Discord, so a slow or failed upload can't hold up the event loop or the pipeline (NFR-05, architecture section 5.2).
         """
         drone = getattr(event, "drone", "")
 
-        # Empty frames do not publish HumanDetected. A gap in this drone's positive events re-arms similarity
-        # checking, so people returning to the same positions can trigger another alert.
+        # Empty frames do not publish HumanDetected. A gap in this drone's positive events re-arms the box
+        # comparison, so people returning to the same positions can trigger another alert.
         last_detection = self.last_detection_times.get(drone)
-        if last_detection is not None and event.time - last_detection > SCENE_RESET_SECONDS:
+        if last_detection is not None and event.time - last_detection > DUPLICATE_WINDOW_SECONDS:
             self.last_alert_boxes.pop(drone, None)
         self.last_detection_times[drone] = event.time
 
-        # check if we should alert based on this drone's cooldown (FR-12)
-        if not should_alert(event, self.last_alert_times.get(drone), self.cooldown):
-            return
-
-        previous_boxes = self.last_alert_boxes.get(drone)
-        if previous_boxes is not None and scenes_are_similar(event.bounding_boxes, previous_boxes):
+        locations = [box.get("location") for box in event.bounding_boxes]
+        if locations and all(locations):
+            people = self.recent_people.setdefault(drone, RecentPeople(DUPLICATE_WINDOW_SECONDS))
+            new = people.new_people(locations, event.time)
+            # a new person held back by the cooldown stays new, so the next frame alerts for them
+            if not new or not should_alert(event, self.last_alert_times.get(drone), self.cooldown):
+                return
+            people.remember(new, event.time)
+        elif not self._new_scene(event, drone):
             return
 
         # add the event to the queue, where it is retried until delivered (FR-11.2)
@@ -74,6 +81,16 @@ class DiscordSubscriber:
         self.last_alert_boxes[drone] = [
             {"box_xyxy": list(box["box_xyxy"])} for box in event.bounding_boxes
         ]
+
+    def _new_scene(self, event, drone):
+        """
+        Fallback when some person has no ground position: boxes in the image can't follow people while the camera
+        moves, so FR-12's window is kept as a cooldown, and after it only a changed scene alerts.
+        """
+        if not should_alert(event, self.last_alert_times.get(drone), max(self.cooldown, DUPLICATE_WINDOW_SECONDS)):
+            return False
+        previous_boxes = self.last_alert_boxes.get(drone)
+        return previous_boxes is None or not scenes_are_similar(event.bounding_boxes, previous_boxes)
 
     def queue_alert(self, event):
         """

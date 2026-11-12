@@ -84,12 +84,17 @@ def geotag(telemetry, boxes, frame_width, frame_height):
     """
     Where the detection is and how it was found: ({"latitude", "longitude"} or None, status), using the
     most confident person in the frame.
+    Also adds each person's own estimated ground position to their box as "location" (FR-08), when it can be
+    estimated, so the alert subscriber can tell people apart across frames (FR-12).
     """
     if not telemetry or not (_number(telemetry.get("latitude")) and _number(telemetry.get("longitude"))):
         return None, UNAVAILABLE
+    for box in boxes:
+        position = ground_position(telemetry, box["box_xyxy"], frame_width, frame_height)
+        if position is not None:
+            box["location"] = {"latitude": position[0], "longitude": position[1]}
     if boxes:
         best = max(boxes, key=lambda box: box.get("confidence", 0))
-        position = ground_position(telemetry, best["box_xyxy"], frame_width, frame_height)
-        if position is not None:
-            return {"latitude": position[0], "longitude": position[1]}, ESTIMATED
+        if "location" in best:
+            return dict(best["location"]), ESTIMATED
     return {"latitude": telemetry["latitude"], "longitude": telemetry["longitude"]}, APPROXIMATE
