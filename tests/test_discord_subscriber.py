@@ -123,6 +123,25 @@ def test_drones_keep_separate_scenes():
     asyncio.run(scenario())
 
 
+def test_queue_alert_sees_only_alerts_that_pass_every_check():
+    # The console's outbox subclass records alerts in queue_alert, so suppressed ones must never reach it.
+    recorded = []
+
+    class RecordingSubscriber(DiscordSubscriber):
+        def queue_alert(self, event):
+            recorded.append(event.time)
+            super().queue_alert(event)
+
+    async def scenario():
+        subscriber = RecordingSubscriber(object())
+        for timestamp in range(3 * COOLDOWN_SECONDS + 1):
+            await subscriber.on_human_detected(detection(timestamp))
+        assert recorded == [0]
+        assert queued_times(subscriber) == [0]
+
+    asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     test_continuously_observed_scene_stays_suppressed_after_cooldown()
     test_scene_seen_during_cooldown_can_alert_once_cooldown_expires()
@@ -131,4 +150,5 @@ if __name__ == "__main__":
     test_quiet_gap_rearms_scene_but_exact_reset_boundary_does_not()
     test_pending_delivery_does_not_accumulate_duplicate_alerts()
     test_drones_keep_separate_scenes()
+    test_queue_alert_sees_only_alerts_that_pass_every_check()
     print("Discord subscriber tests passed")

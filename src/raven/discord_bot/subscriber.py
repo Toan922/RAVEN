@@ -65,7 +65,7 @@ class DiscordSubscriber:
             return
 
         # add the event to the queue, where it is retried until delivered (FR-11.2)
-        self.alerts.put_nowait(event)
+        self.queue_alert(event)
 
         # start the cooldown when queued, not when sent, or every frame during an outage would queue another alert (FR-12)
         self.last_alert_times[drone] = event.time
@@ -74,6 +74,13 @@ class DiscordSubscriber:
         self.last_alert_boxes[drone] = [
             {"box_xyxy": list(box["box_xyxy"])} for box in event.bounding_boxes
         ]
+
+    def queue_alert(self, event):
+        """
+        Put an alert that passed the cooldown and similarity checks on the queue. Subclasses override it to also
+        keep a durable copy (the console's outbox), so only alerts that will really be sent are recorded.
+        """
+        self.alerts.put_nowait(event)
 
     async def deliver_alerts(self):
         """
