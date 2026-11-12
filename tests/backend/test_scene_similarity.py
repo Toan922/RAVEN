@@ -1,4 +1,4 @@
-"""Box matching tests; run with pytest or python tests/test_scene_similarity.py."""
+"""Box matching tests; run with pytest or python tests/backend/test_scene_similarity.py."""
 
 from raven.backend.scene_similarity import scenes_are_similar
 

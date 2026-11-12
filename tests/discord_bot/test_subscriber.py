@@ -1,4 +1,5 @@
-"""Alert queue tests; run with pytest or python tests/test_discord_subscriber.py."""
+"""discord_bot/subscriber.py: alert queue, duplicate suppression (FR-12) and alert contents (FR-10.2).
+Run with pytest, or python tests/discord_bot/test_subscriber.py (skips tests that need fixtures)."""
 
 import asyncio
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from raven.discord_bot.subscriber import (
     COOLDOWN_SECONDS,
     DUPLICATE_WINDOW_SECONDS,
     DiscordSubscriber,
+    create_discord_alert,
 )
 
 # detections without "location" on their boxes (no telemetry) use the image-box fallback, where FR-12's
@@ -212,6 +214,16 @@ def test_frame_without_ground_positions_falls_back_to_the_window():
         assert queued_times(subscriber) == [0, WINDOW]
 
     asyncio.run(scenario())
+
+
+def test_discord_labels_approximate_and_unavailable_locations(make_event):
+    estimated = create_discord_alert(make_event(telemetry={"latitude": 1.0, "longitude": 2.0},
+                                            location={"latitude": 1.5, "longitude": 2.5}, location_status="estimated"))
+    assert estimated.fields[0].name == "Location" and estimated.fields[0].value.startswith("1.50000, 2.50000")
+    approximate = create_discord_alert(make_event(telemetry={"latitude": 1.0, "longitude": 2.0}))
+    assert "Approximate (drone position)" in approximate.fields[0].name
+    missing = create_discord_alert(make_event(location_status="unavailable"))
+    assert missing.fields[0].value == "Location not available"
 
 
 if __name__ == "__main__":
