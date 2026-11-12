@@ -17,6 +17,7 @@ import discord
 from bubus import EventBus
 from dotenv import load_dotenv
 
+from raven.backend.bus import ThreadSafeBus
 from raven.backend.detection import detect_humans, load_model
 from raven.backend.events import HumanDetected, PipelineStatus
 from raven.backend.frame_sampler import sample_frame
@@ -35,22 +36,6 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 
 # frames with detections are saved here, HumanDetected.frame points at them
 FRAMES_DIR = ROOT_DIR / "runs" / "ingest"
-
-class ThreadSafeBus:
-    """
-    Wraps the event bus so code running in worker threads can publish to it.
-    bubus only accepts dispatch() from the thread running its event loop, so dispatch() here hands each
-    event to that thread instead of calling the bus directly. It returns right away and never blocks the worker.
-    """
-    
-    def __init__(self, event_bus, loop):
-        # the real bus, and the event loop (bus thread) it runs on
-        self.event_bus = event_bus
-        self.loop = loop
-
-    def dispatch(self, event):
-        # schedule the event dispatch to happen in the event loop thread
-        self.loop.call_soon_threadsafe(self.event_bus.dispatch, event)
 
 def run_detections(worker_bus, telemetry_receiver, model, stop):
     """

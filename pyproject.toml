@@ -16,6 +16,10 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# the operator console's map page and icons
+[tool.setuptools.package-data]
+"raven.gui" = ["map.html", "assets/*.svg"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+<style>
+  html, body, #map { height: 100%; margin: 0; background: #dfe3e8; }
+  #notice {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000;
+    background: #fff4d6; color: #5c4300; border: 1px solid #f5a524; border-radius: 6px;
+    padding: 6px 12px; font: 13px system-ui, sans-serif; display: none;
+  }
+  #empty {
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 1000;
+    background: rgba(255,255,255,.9); border-radius: 6px; padding: 6px 12px;
+    font: 13px system-ui, sans-serif; color: #444;
+  }
+  /* a clicked pin gets the browser's keyboard-focus outline (an orange square); the blue ring shows the selection */
+  .leaflet-pins-pane path:focus, .leaflet-pins-pane path:focus-visible { outline: none; }
+  .fit-button { background: #fff; font: bold 12px system-ui, sans-serif; padding: 4px 8px; cursor: pointer; }
+  .fit-button:hover { background: #f4f4f4; }
+  .drone-cluster div {
+    width: 30px; height: 30px; margin: 5px; border-radius: 50%; color: #fff; text-align: center;
+    font: bold 12px/30px system-ui, sans-serif; box-shadow: 0 0 0 5px rgba(255,255,255,.55);
+  }
+  body.dark .drone-cluster div { box-shadow: 0 0 0 5px rgba(0,0,0,.35); }
+  .legend {
+    background: rgba(255,255,255,.92); border-radius: 6px; padding: 6px 10px; display: none;
+    font: 12px system-ui, sans-serif; color: #1c1f24; box-shadow: 0 1px 4px rgba(0,0,0,.25); line-height: 1.6;
+  }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;
+                 vertical-align: -1px; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.25); }
+  .legend .drone-row { cursor: pointer; border-radius: 4px; padding: 2px 6px; margin: 0 -6px; user-select: none; }
+  .legend .drone-row:hover { background: rgba(0,0,0,.07); }
+  .legend .drone-row:active { background: rgba(0,0,0,.16); }
+  .legend .key { color: #6b7280; margin-top: 4px; border-top: 1px solid #d3d7dd; padding-top: 4px; }
+
+  /* dark mode: darken the map tiles (pins and labels keep their real colors) and the controls */
+  body.dark, body.dark #map { background: #1d2025; }
+  body.dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9); }
+  body.dark .leaflet-bar a, body.dark .fit-button { background: #2d3239; color: #e6e8eb; border-color: #3a4048; }
+  body.dark .leaflet-bar a:hover, body.dark .fit-button:hover { background: #3a4048; }
+  body.dark .leaflet-control-attribution { background: rgba(29, 32, 37, .8); color: #99a1ac; }
+  body.dark .leaflet-control-attribution a { color: #8fb4ff; }
+  body.dark .leaflet-tooltip { background: #2d3239; color: #e6e8eb; border-color: #3a4048; }
+  body.dark .leaflet-tooltip-top:before { border-top-color: #2d3239; }
+  body.dark #empty { background: rgba(45, 50, 57, .92); color: #e6e8eb; }
+  body.dark #notice { background: #3d3214; color: #f5d68a; }
+  body.dark .legend { background: rgba(45, 50, 57, .94); color: #e6e8eb; }
+  body.dark .legend .key { color: #99a1ac; border-top-color: #3a4048; }
+  body.dark .legend .drone-row:hover { background: rgba(255,255,255,.09); }
+  body.dark .legend .drone-row:active { background: rgba(255,255,255,.18); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="notice"></div>
+<div id="empty">No alerts yet. Detections appear here as pins at the drone's position.</div>
+
+<script>/*QWEBCHANNEL_JS*/</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script>
+var bridge = null;
+// pins are filled with their drone's color; the ring and fading show the alert's status
+var RINGS = { "new": "#ffffff", "reviewed": "#30a46c", "dismissed": "#8b8d98" };
+var FILL_OPACITY = { "new": 0.95, "reviewed": 0.55, "dismissed": 0.2 };
+var DEFAULT_COLOR = "#0090ff";
+
+function showNotice(text) {
+  var el = document.getElementById("notice");
+  el.textContent = text;
+  el.style.display = text ? "block" : "none";
+}
+
+// works with or without Leaflet, so the page follows the theme even offline
+window.setTheme = function (name) { document.body.classList.toggle("dark", name === "dark"); };
+
+// stubs, replaced below when Leaflet loaded, so Python calls never fail offline
+window.addAlerts = window.focusAlert = window.unfocusAlert = window.setStatus = window.clearAlerts = window.fitAll =
+  window.setDroneColors = window.setDronePositions = window.goToDrone = function () {};
+
+if (typeof L === "undefined") {
+  showNotice("The map library could not be loaded. Check the internet connection and restart the console.");
+} else {
+  var map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
+  var tilesFailing = false;
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).on("tileerror", function () {
+    if (!tilesFailing) { tilesFailing = true; showNotice("Map tiles could not be loaded. Pins still work, but the map background needs internet."); }
+  }).on("tileload", function () {
+    if (tilesFailing) { tilesFailing = false; showNotice(""); }
+  }).addTo(map);
+
+  // pins sit in their own layer above the cluster bubbles, so a spread-out cluster's pins are never covered
+  // by a neighboring bubble (Leaflet's marker pane, where the bubbles live, is 600)
+  map.createPane("pins").style.zIndex = 620;
+
+  // fold spread-out clusters at once: the pins are removed immediately either way, and the animated version
+  // only fades the arms out, leaving them on screen for a moment with nothing at their ends
+  L.MarkerCluster.prototype._animationUnspiderfy = function () { this._noanimationUnspiderfy(); };
+
+  // spread a cluster out without its arms growing from the center (Leaflet.markercluster's own non-animated
+  // version, which this build leaves out), used when an open cluster is re-laid out with new pins
+  function spiderfyNow(childMarkers, positions) {
+    var group = this._group, fg = group._featureGroup, legOptions = group.options.spiderLegPolylineOptions;
+    group._ignoreMove = true;
+    for (var i = 0; i < childMarkers.length; i++) {
+      var m = childMarkers[i], at = map.layerPointToLatLng(positions[i]);
+      var leg = new L.Polyline([this._latlng, at], legOptions);
+      map.addLayer(leg);
+      m._spiderLeg = leg;
+      m._preSpiderfyLatlng = m._latlng;
+      m.setLatLng(at);
+      if (m.setZIndexOffset) { m.setZIndexOffset(1000000); }
+      fg.addLayer(m);
+    }
+    this.setOpacity(0.3);
+    group._ignoreMove = false;
+    group.fire("spiderfied", { cluster: this, markers: childMarkers });
+  }
+
+  // one cluster group per drone, so a cluster bubble only ever holds one drone's pins and wears its color
+  var clusters = {};
+  function clusterFor(drone, color) {
+    if (!clusters[drone]) {
+      var group = L.markerClusterGroup({
+        showCoverageOnHover: false, maxClusterRadius: 40,
+        // clicks are handled below, so a second click on a spread-out cluster folds it back up
+        spiderfyOnMaxZoom: false, zoomToBoundsOnClick: false,
+        spiderLegPolylineOptions: { pane: "pins", weight: 2.5, opacity: 0.9, color: color || DEFAULT_COLOR },
+        iconCreateFunction: function (c) {
+          return L.divIcon({
+            html: '<div style="background:' + (group.droneColor || DEFAULT_COLOR) + '">' + c.getChildCount() + "</div>",
+            className: "drone-cluster", iconSize: L.point(40, 40)
+          });
+        }
+      });
+      group.droneColor = color;
+      group.spread = null;
+      // adding a pin next to a spread-out cluster would fold it, so while one is spread, that drone's new pins
+      // near it wait here, and the cluster is re-laid out with them shortly after (see addToCluster, respread)
+      group.pending = [];
+      group.on("clusterclick", function (e) { clusterClicked(group, e.layer); });
+      group.on("spiderfied", function (e) {
+        group.spread = e.cluster;
+        // only one cluster is spread out at a time, across all drones
+        Object.keys(clusters).forEach(function (name) {
+          if (clusters[name] !== group && clusters[name].spread) { clusters[name].spread.unspiderfy(); }
+        });
+      });
+      group.on("unspiderfied", function () {
+        // a re-layout folds and spreads the cluster again in one go: not a fold the operator made
+        if (group.respreading) { return; }
+        group.spread = null;
+        // after Leaflet finishes folding: it fires this before it's done, and lifting the selected pin out
+        // of the group mid-fold would start another fold
+        setTimeout(function () { keepFocusVisible(); flushPending(group); }, 0);
+      });
+      map.addLayer(group);
+      clusters[drone] = group;
+    }
+    return clusters[drone];
+  }
+
+  // pins this close (in screen pixels) to a spread-out cluster could join it, which would fold it
+  var HOLD_RADIUS = 80;  // twice maxClusterRadius
+
+  function nearSpread(group, marker) {
+    var center = map.latLngToLayerPoint(group.spread.getLatLng());
+    return center.distanceTo(map.latLngToLayerPoint(marker.getLatLng())) < HOLD_RADIUS;
+  }
+
+  // Leaflet.markercluster folds the spread-out cluster on every add, even for a pin far away from it;
+  // adding with that step switched off leaves the spread cluster alone
+  function addWithoutFolding(group, marker) {
+    group._unspiderfy = null;
+    try { group.addLayer(marker); } finally { delete group._unspiderfy; }
+  }
+
+  // add pins to their group; while it has a cluster spread out, pins that could join that cluster wait a moment
+  // and the open cluster is re-laid out with them, and the rest are added right away
+  function addToCluster(group, list) {
+    if (group.spread) {
+      list.forEach(function (m) {
+        if (nearSpread(group, m)) { group.pending.push(m); } else { addWithoutFolding(group, m); }
+      });
+      if (group.pending.length) { scheduleRespread(group); }
+      return;
+    }
+    if (list.length === 1) { group.addLayer(list[0]); } else if (list.length) { group.addLayers(list); }
+  }
+
+  // An open cluster takes in new pins by folding and spreading again in one step, with no animation, so they
+  // show up as new arms. At most once a second, so a burst of alerts doesn't redraw it constantly, and not while
+  // the mouse is on one of its pins: the arms shift to make room, which would move the pin out from under it.
+  var RESPREAD_INTERVAL_MS = 1000;
+  var hovered = null;  // the pin under the mouse
+
+  function scheduleRespread(group) {
+    if (group.respreadTimer) { return; }
+    var wait = Math.max(0, (group.lastRespread || 0) + RESPREAD_INTERVAL_MS - Date.now());
+    group.respreadTimer = setTimeout(function () { group.respreadTimer = null; respread(group); }, wait);
+  }
+
+  function respread(group) {
+    var cluster = group.spread;
+    if (!cluster || !group.pending.length) { return; }
+    if (hovered && hovered.cluster === group && hovered._preSpiderfyLatlng) { group.respreadAfterHover = true; return; }
+
+    var anchor = cluster.getAllChildMarkers()[0];
+    var list = group.pending.filter(function (m) { return m !== lifted && !group.hasLayer(m); });
+    group.pending = [];
+    var selectedHere = focused && focused !== lifted && focused.cluster === group && !!focused._preSpiderfyLatlng;
+
+    group.respreading = true;
+    try {
+      cluster.unspiderfy();
+      group.spread = null;
+      if (list.length === 1) { group.addLayer(list[0]); } else if (list.length) { group.addLayers(list); }
+      var next = group.getVisibleParent(anchor);
+      if (next && next.spiderfy) {
+        next._animationSpiderfy = spiderfyNow;
+        try { next.spiderfy(); } finally { delete next._animationSpiderfy; }
+      }
+    } finally {
+      group.respreading = false;
+    }
+    group.lastRespread = Date.now();
+
+    if (selectedHere) {
+      if (focused._preSpiderfyLatlng && group.spread) {
+        // the selected pin moved with the new layout: its ring, label and remembered spot follow it
+        focused.spreadSpot = { latlng: focused.getLatLng(), center: group.spread.getLatLng(), zoom: map.getZoom() };
+        drawRing();
+        focused.openTooltip();
+      } else {
+        keepFocusVisible();
+      }
+    }
+  }
+
+  function flushPending(group) {
+    if (group.spread || !group.pending.length) { return; }
+    var list = group.pending.filter(function (m) { return m !== lifted && !group.hasLayer(m); });
+    group.pending = [];
+    addToCluster(group, list);
+  }
+
+  function clusterClicked(group, cluster) {
+    // clicking the cluster that's spread out folds it back
+    if (group.spread === cluster) { cluster.unspiderfy(); return; }
+    // otherwise zoom in, or spread the pins out when zooming in can't separate them (same as Leaflet's default)
+    var bottom = cluster;
+    while (bottom._childClusters.length === 1) { bottom = bottom._childClusters[0]; }
+    if (bottom._zoom === group._maxZoom && bottom._childCount === cluster._childCount) {
+      cluster.spiderfy();
+    } else {
+      cluster.zoomToBounds({ padding: [30, 30] });
+    }
+  }
+
+  var markers = {};
+  var highlight = null;
+  var focused = null;
+  // the selected pin is lifted out of its cluster into this layer, so it stays visible at every zoom
+  var lifted = null;
+  var liftedLayer = L.layerGroup().addTo(map);
+  var fitted = false;
+
+  function lift(marker) {
+    if (lifted === marker) { return; }
+    drop();
+    var waiting = marker.cluster.pending.indexOf(marker);
+    if (waiting >= 0) { marker.cluster.pending.splice(waiting, 1); } else { marker.cluster.removeLayer(marker); }
+    liftedLayer.addLayer(marker);
+    lifted = marker;
+  }
+
+  function drop() {
+    if (!lifted) { return; }
+    var marker = lifted;
+    lifted = null;
+    liftedLayer.removeLayer(marker);
+    goHome(marker);
+    // clicking a spread-out cluster's pin drops the previous selection: don't fold the cluster being clicked in
+    addToCluster(marker.cluster, [marker]);
+  }
+
+  // A pin selected while its cluster was spread out remembers that spot (marker.spreadSpot), so when the cluster
+  // folds it stays where the operator clicked it instead of jumping to the cluster. The spot only means something
+  // at the zoom it was picked at, so after zooming, or when the pin goes back into its cluster, it returns to its
+  // real position (marker.home).
+  function goHome(marker) {
+    marker.spreadSpot = null;
+    if (!marker.getLatLng().equals(marker.home)) { marker.setLatLng(marker.home); }
+  }
+
+  function placeLifted() {
+    if (!lifted || !lifted.spreadSpot) { return; }
+    if (lifted.spreadSpot.zoom === map.getZoom()) {
+      if (!lifted.getLatLng().equals(lifted.spreadSpot.latlng)) { lifted.setLatLng(lifted.spreadSpot.latlng); }
+    } else {
+      goHome(lifted);
+    }
+  }
+
+  // the selected pin's ring, and its arm back to the cluster when it stayed where it sat in a folded cluster
+  var arm = null;
+  function drawRing() {
+    if (highlight) { map.removeLayer(highlight); highlight = null; }
+    if (arm) { map.removeLayer(arm); arm = null; }
+    if (!focused || !focused._map) { return; }
+    if (focused === lifted && focused.spreadSpot) {
+      arm = L.polyline([focused.spreadSpot.center, focused.getLatLng()], {
+        pane: "pins", weight: 2.5, opacity: 0.9, color: focused.droneColor || DEFAULT_COLOR, interactive: false
+      }).addTo(map);
+      // under the pins, like the cluster's own arms
+      arm.bringToBack();
+    }
+    highlight = L.circleMarker(focused.getLatLng(), {
+      pane: "pins", radius: 16, weight: 3, color: "#0090ff", fill: false, interactive: false
+    }).addTo(map);
+  }
+
+  // the selected pin would vanish into a cluster after zooming out or folding a spread-out cluster: lift it out
+  function keepFocusVisible() {
+    var reshown = false;
+    if (focused && !focused._map) { lift(focused); reshown = true; }
+    placeLifted();
+    drawRing();
+    // the label closes when the pin leaves its cluster; the selected pin keeps it open
+    if (reshown) { focused.openTooltip(); }
+  }
+  map.on("zoomend", keepFocusVisible);
+
+  var FitControl = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd: function () {
+      var el = L.DomUtil.create("div", "leaflet-bar fit-button");
+      el.textContent = "Fit all";
+      el.title = "Zoom to show every alert";
+      L.DomEvent.disableClickPropagation(el);
+      L.DomEvent.on(el, "click", function () { fitAll(); });
+      return el;
+    }
+  });
+  map.addControl(new FitControl());
+
+  // a dashed ring: the pin sits at the drone's position, not the person's estimated position
+  function styleFor(status, color, approx) {
+    return { radius: 8, weight: status === "reviewed" ? 3 : 2, color: RINGS[status] || RINGS["new"],
+             fillColor: color || DEFAULT_COLOR, fillOpacity: FILL_OPACITY[status] || 0.95,
+             dashArray: approx ? "3 3" : null };
+  }
+
+  // legend: one row per drone with pins or a known position, plus what the rings mean; click a drone to go to it
+  var drones = {};
+  var positions = {};  // drone name -> {lat, lon, color}: where its telemetry last put it
+  var Legend = L.Control.extend({
+    options: { position: "bottomleft" },
+    onAdd: function () {
+      var el = L.DomUtil.create("div", "legend");
+      L.DomEvent.disableClickPropagation(el);
+      L.DomEvent.disableScrollPropagation(el);
+      L.DomEvent.on(el, "click", function (e) {
+        var row = e.target.closest(".drone-row");
+        if (row) { goToDrone(row.getAttribute("data-drone")); }
+      });
+      return el;
+    }
+  });
+  var legend = new Legend();
+  map.addControl(legend);
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function updateLegend() {
+    var el = legend.getContainer();
+    var names = Object.keys(drones).sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true }); });
+    if (!names.length) { el.style.display = "none"; return; }
+    var rows = names.map(function (name) {
+      return '<div class="drone-row" data-drone="' + escapeHtml(name) + '" title="Go to ' + escapeHtml(name) + '">' +
+        '<span class="dot" style="background:' + drones[name] + '"></span>' + escapeHtml(name) + "</div>";
+    });
+    rows.push('<div class="key">Click a drone to go to it<br>White ring: new · green ring: reviewed · faded: dismissed<br>Dashed ring: approximate (drone position)</div>');
+    var html = rows.join("");
+    // only rebuild when something changed: new pins arrive many times a second, and replacing a row
+    // between mouse press and release would swallow the click
+    if (html !== el.legendHtml) { el.innerHTML = html; el.legendHtml = html; }
+    el.style.display = "block";
+  }
+
+  // a drone's pins, including any waiting for its spread-out cluster to fold
+  function extendByCluster(bounds, group) {
+    var b = group.getBounds();
+    if (b.isValid()) { bounds.extend(b); }
+    group.pending.forEach(function (m) { bounds.extend(m.getLatLng()); });
+  }
+
+  window.fitAll = function () {
+    var bounds = L.latLngBounds([]);
+    Object.keys(clusters).forEach(function (name) { extendByCluster(bounds, clusters[name]); });
+    if (lifted) { bounds.extend(lifted.getLatLng()); }
+    if (bounds.isValid()) { map.fitBounds(bounds.pad(0.2), { maxZoom: 17 }); }
+  };
+
+  // a drone's latest position if its telemetry gave one, otherwise the area of its pins
+  window.goToDrone = function (name) {
+    var here = positions[name];
+    if (here) {
+      map.setView([here.lat, here.lon], Math.max(map.getZoom(), 15));
+      return;
+    }
+    var bounds = L.latLngBounds([]);
+    if (clusters[name]) { extendByCluster(bounds, clusters[name]); }
+    if (lifted && lifted.drone === name) { bounds.extend(lifted.getLatLng()); }
+    if (!bounds.isValid()) { return; }
+    if (bounds.getNorthEast().equals(bounds.getSouthWest())) {
+      map.setView(bounds.getCenter(), Math.max(map.getZoom(), 15));
+    } else {
+      map.fitBounds(bounds.pad(0.2), { maxZoom: 16 });
+    }
+  };
+
+  window.setDronePositions = function (list) {
+    positions = list;
+    var added = false;
+    Object.keys(list).forEach(function (name) {
+      if (!drones[name]) { drones[name] = list[name].color || DEFAULT_COLOR; added = true; }
+    });
+    if (added) { updateLegend(); }
+  };
+
+  window.addAlerts = function (list) {
+    // one addLayers per drone, so a burst of alerts redraws each drone's bubbles once
+    var batches = {};
+    list.forEach(function (a) {
+      if (markers[a.id]) { return; }
+      var style = styleFor(a.status, a.color, a.approx);
+      style.pane = "pins";
+      // keep clicks on the pin: Leaflet passes clicks on circle markers on to the map by default, and a map click
+      // folds the spread-out cluster the pin belongs to, so the selected pin would jump back to the cluster center
+      style.bubblingMouseEvents = false;
+      var marker = L.circleMarker([a.lat, a.lon], style);
+      marker.droneColor = a.color;
+      marker.drone = a.drone;
+      marker.status = a.status;
+      marker.approx = !!a.approx;
+      marker.home = L.latLng(a.lat, a.lon);
+      marker.spreadSpot = null;
+      if (a.drone && !drones[a.drone]) { drones[a.drone] = a.color || DEFAULT_COLOR; }
+      marker.bindTooltip(a.label, { direction: "top", offset: [0, -6] });
+      marker.on("mouseover", function () { hovered = marker; });
+      marker.on("mouseout", function () {
+        if (hovered === marker) { hovered = null; }
+        // new pins that arrived while the mouse was on this cluster's pins join now
+        var group = marker.cluster;
+        if (group.respreadAfterHover) { group.respreadAfterHover = false; scheduleRespread(group); }
+      });
+      // clicking the selected pin again unselects it
+      marker.on("click", function () {
+        if (focused === marker) {
+          unfocusAlert();
+          if (bridge) { bridge.markerUnselected(a.id); }
+        } else {
+          if (bridge) { bridge.markerClicked(a.id); }
+          focusAlert(a.id, true);
+        }
+      });
+      markers[a.id] = marker;
+      marker.cluster = clusterFor(a.drone || "", a.color);
+      (batches[a.drone || ""] = batches[a.drone || ""] || []).push(marker);
+    });
+    Object.keys(batches).forEach(function (name) { addToCluster(clusters[name], batches[name]); });
+    document.getElementById("empty").style.display = Object.keys(markers).length ? "none" : "block";
+    updateLegend();
+    // zoom to the alerts the first time some arrive, after that leave the view to the operator
+    if (!fitted && Object.keys(markers).length) { fitted = true; fitAll(); }
+  };
+
+  window.focusAlert = function (id, keepZoom) {
+    var marker = markers[id];
+    if (!marker) { return; }
+    // only the focused pin keeps its label open
+    if (focused && focused !== marker) { focused.closeTooltip(); }
+    focused = marker;
+    if (lifted && lifted !== marker) { drop(); }
+    if (keepZoom) {
+      // clicked on the map: it's already visible (on its own, or as a spread-out cluster's pin), leave it there,
+      // and remember the spot if it's a spread-out cluster's pin so it stays there when the cluster folds
+      if (lifted !== marker) {
+        var spread = marker._preSpiderfyLatlng && marker.cluster.spread;
+        marker.spreadSpot = spread
+          ? { latlng: marker.getLatLng(), center: spread.getLatLng(), zoom: map.getZoom() } : null;
+      }
+      keepFocusVisible();
+    } else {
+      // picked from the list: lift it out of its cluster so it shows at once, at its real position, then zoom in on it
+      lift(marker);
+      goHome(marker);
+      drawRing();
+      map.setView(marker.getLatLng(), Math.max(map.getZoom(), 16));
+    }
+    marker.openTooltip();
+  };
+
+  // clear the selection: no ring, arm or open label, and a pin that was lifted out goes back into its cluster
+  window.unfocusAlert = function () {
+    if (!focused) { return; }
+    focused.closeTooltip();
+    focused = null;
+    drop();
+    drawRing();
+  };
+
+  window.setStatus = function (id, status) {
+    if (markers[id]) { markers[id].status = status; markers[id].setStyle(styleFor(status, markers[id].droneColor, markers[id].approx)); }
+  };
+
+  window.setDroneColors = function (colors) {
+    Object.keys(markers).forEach(function (id) {
+      var marker = markers[id];
+      if (colors[marker.drone]) {
+        marker.droneColor = colors[marker.drone];
+        marker.setStyle(styleFor(marker.status, marker.droneColor, marker.approx));
+      }
+    });
+    Object.keys(colors).forEach(function (name) {
+      if (drones[name]) { drones[name] = colors[name]; }
+      if (clusters[name]) {
+        clusters[name].droneColor = colors[name];
+        clusters[name].options.spiderLegPolylineOptions.color = colors[name];
+        clusters[name].refreshClusters();
+      }
+    });
+    updateLegend();
+  };
+
+  window.clearAlerts = function () {
+    Object.keys(clusters).forEach(function (name) { map.removeLayer(clusters[name]); });
+    clusters = {};
+    liftedLayer.clearLayers();
+    lifted = null;
+    markers = {};
+    if (highlight) { map.removeLayer(highlight); highlight = null; }
+    if (arm) { map.removeLayer(arm); arm = null; }
+    focused = null;
+    fitted = false;
+    drones = {};
+    // drones with a known position stay in the legend so they can still be found
+    Object.keys(positions).forEach(function (name) { drones[name] = positions[name].color || DEFAULT_COLOR; });
+    updateLegend();
+    document.getElementById("empty").style.display = "block";
+  };
+}
+
+new QWebChannel(qt.webChannelTransport, function (channel) {
+  bridge = channel.objects.bridge;
+  bridge.pageReady();
+});
+</script>
+</body>
+</html>
