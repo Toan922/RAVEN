@@ -17,6 +17,9 @@ COOLDOWN_SECONDS = 2
 # FR-11.2: seconds to wait before trying a failed alert again
 RETRY_SECONDS = 3
 
+# people listed in one alert: Discord rejects embeds over 25 fields, and a rejected alert would retry forever
+MAX_PEOPLE_LISTED = 10
+
 class DiscordSubscriber:
     """
     Alert Notification subsystem (architecture sections 2.2 and 6): subscribes to HumanDetected on the
@@ -157,12 +160,60 @@ def render_boxes(event):
 
     return image
 
+def alert_people(event):
+    """
+    The people in a detection event, numbered for the alert so the numbers on the frame image and the
+    embed's fields match (FR-10.2, NFR-07). Numbered from 1, highest confidence first.
+    Returns a list of dicts, one per bounding box:
+    - number: the person's number in the alert
+    - box: their [x1, y1, x2, y2] in the frame
+    - confidence: the model's confidence score
+    - location: {"latitude", "longitude"} in decimal degrees (NFR-06), or None
+    - status: how location was found (FR-08, FR-09):
+        "estimated" (the person's own ground position, from geotag),
+        "approximate" (geotag couldn't place them, so the drone's position from the frame's telemetry), or
+        "unavailable" (no position data, location is None; the alert still sends)
+    """
+    people = []
+
+    # the drone's own position, the fallback for people geotag couldn't place: only the coordinates, and only
+    # when the telemetry row has both (it also holds altitude, heading and the receiver's timestamp)
+    telemetry = event.telemetry or {}
+    drone_position = None
+    if "latitude" in telemetry and "longitude" in telemetry:
+        drone_position = {"latitude": telemetry["latitude"], "longitude": telemetry["longitude"]}
+
+    # sort the bounding boxes by confidence, highest first
+    sorted_boxes = sorted(event.bounding_boxes, key=lambda box: box["confidence"], reverse=True)
+
+    for number, bounding_box in enumerate(sorted_boxes, start=1):
+        box = bounding_box["box_xyxy"]
+        confidence = bounding_box["confidence"]
+        location = bounding_box.get("location")
+        if location:
+            status = "estimated"
+        elif drone_position:
+            location, status = drone_position, "approximate"
+        else:
+            location, status = None, "unavailable"
+        people.append({
+            "number": number,
+            "box": box,
+            "confidence": confidence,
+            "location": location,
+            "status": status
+        })
+
+    return people
+
 def create_discord_alert(event):
     """
     Create a Discord embed message for the given detection event (FR-10.2, NFR-07).
-    Coordinates are in decimal degrees (NFR-06). The location is the person's estimated ground position when the
-    event has one (FR-08); otherwise the drone's position, labelled approximate, or "not available" when the frame
-    has no telemetry, and the alert still sends (FR-09).
+    Each person gets their own line, numbered as in alert_people(): classification, confidence score and their own
+    location in decimal degrees (NFR-06) with a Google Maps link. The location is the person's estimated ground
+    position (FR-08); otherwise the drone's position, labelled approximate, or "Location unavailable" when the frame
+    has no position data, and the alert still sends (FR-09). Crowded frames list the MAX_PEOPLE_LISTED most
+    confident people, then how many more are in the image.
     Returns a discord.Embed object.
     """
     
@@ -176,36 +227,21 @@ def create_discord_alert(event):
         color=discord.Color.red()
     )
 
-    # add the location information to the embed (FR-10.2); events from before geotagging only have the
-    # drone's position, which is approximate
-    status = getattr(event, "location_status", "") or ""
-    location = getattr(event, "location", None)
-    if status != "estimated" or not location:
-        location = event.telemetry if status != "unavailable" else None
-    if location:
-        latitude = location["latitude"]
-        longitude = location["longitude"]
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={latitude},{longitude}"
-
-        embed.add_field(
-            name="Location" if status == "estimated" else "Location: Approximate (drone position)",
-            value=f"{latitude:.5f}, {longitude:.5f} [View on Maps]({maps_url})",
-            inline=False
-        )
-    else:
-        embed.add_field(
-            name="Location",
-            value="Location not available",
-            inline=False
-        )
-
-    # add the highest confidence score in the frame to the embed (FR-10.2)
-    best_confidence = max(bounding_box["confidence"] for bounding_box in event.bounding_boxes)
-    embed.add_field(
-        name="Confidence Score",
-        value=f"{best_confidence:.2f}",
-        inline=False
-    )
+    # one line per person (FR-10.2), most confident first
+    people = alert_people(event)
+    for person in people[:MAX_PEOPLE_LISTED]:
+        location = person["location"]
+        if location is None:
+            value = "Location unavailable"
+        else:
+            latitude, longitude = location["latitude"], location["longitude"]
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={latitude},{longitude}"
+            value = f"{latitude:.5f}, {longitude:.5f} · [Open in Google Maps]({maps_url})"
+            if person["status"] == "approximate":
+                value = f"Approximate (drone position): {value}"
+        embed.add_field(name=f"Person {person['number']} · Human · {person['confidence']:.2f}", value=value, inline=False)
+    if len(people) > MAX_PEOPLE_LISTED:
+        embed.add_field(name="More people", value=f"+{len(people) - MAX_PEOPLE_LISTED} more in the image", inline=False)
 
     # attach the frame image to the embed (FR-10.2)
     embed.set_image(url="attachment://image.png")
