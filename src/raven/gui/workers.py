@@ -17,7 +17,7 @@ from raven.backend.config import FeedConfig, RavenConfig, parse_udp_address, str
 from raven.backend.detection_log import event_record
 from raven.backend.events import HumanDetected, PipelineStatus
 
-# how long stopping Discord waits for queued alerts to send, the same limit raven.pipeline uses at shutdown
+# how long stopping Discord waits for queued alerts to send
 DISCORD_SHUTDOWN_TIMEOUT_S = 5.0
 
 
@@ -310,7 +310,7 @@ class DiscordAlerts(QObject):
             return
         import discord
         from raven.backend.events import HumanDetected as Event
-        from raven.discord_bot.subscriber import DiscordSubscriber, should_alert
+        from raven.discord_bot.subscriber import DiscordSubscriber
 
         try:
             webhook = discord.SyncWebhook.from_url(config.webhook_url)
@@ -325,13 +325,13 @@ class DiscordAlerts(QObject):
         queued = self._queued
 
         class OutboxSubscriber(DiscordSubscriber):
-            async def on_human_detected(self, event):
-                # write it down before queueing it, so a crash right after still leaves it in the outbox
-                if should_alert(event, self.last_alert_times.get(getattr(event, "drone", "")), self.cooldown):
-                    record = event_record(event)
-                    outbox.add(record)
-                    queued.add(record["id"])
-                await super().on_human_detected(event)
+            def queue_alert(self, event):
+                # write it down before queueing it, so a crash right after still leaves it in the outbox;
+                # called only after the cooldown and scene checks, so suppressed alerts never reach the outbox
+                record = event_record(event)
+                outbox.add(record)
+                queued.add(record["id"])
+                super().queue_alert(event)
 
         def sent(event):
             outbox.mark_sent(str(event.event_id))

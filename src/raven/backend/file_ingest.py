@@ -2,7 +2,7 @@
 Ingest for the operator console: reads a recorded video file (or a stream link) with a telemetry CSV,
 runs the person detector on about analysis_fps frames per second of video, and publishes a HumanDetected event on the
 Detection Event Bus for each checked frame with people in it.
-raven.pipeline is the live counterpart: a UDP stream from the ground station with live UDP telemetry.
+stream_ingest is the live counterpart: a UDP stream from the ground station with live UDP telemetry.
 """
 
 import csv

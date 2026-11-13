@@ -12,11 +12,18 @@ cd RAVEN
 ```
 
 **2. Create and activate a virtual environment** (activate it again in every new terminal)
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+- **macOS:**
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  ```
 
+- **Windows:**
+  **Command Prompt / VS Code Terminal:**
+  ```cmd
+  python -m venv .venv
+  .\.venv\Scripts\activate.bat
+  ```
 **3. Install RAVEN and its Python dependencies**
 ```bash
 pip install -e .
@@ -24,10 +31,23 @@ pip install -e .
 This installs everything in `requirements.txt` and makes the `raven` package importable, so modules run with `python -m raven.<package>.<module>`. Code edits take effect without reinstalling.
 
 **4. Install ffmpeg** (a system program, not a pip package, so it does not go in the venv)
-```bash
-sudo apt install ffmpeg
-ffmpeg -version   # should print a version
-```
+- **macOS:**
+  ```bash
+  brew install ffmpeg
+  ffmpeg -version   # should print a version
+  ```
+
+- **Windows:**
+  ```powershell
+  winget install Gyan.FFmpeg
+  ffmpeg -version   # restart terminal first if not recognized
+  ```
+
+- **Linux / WSL:**
+  ```bash
+  sudo apt install ffmpeg
+  ffmpeg -version   # should print a version
+  ```
 
 **5. Get the datasets** (not stored in Git). Download them from the team Google Drive and put them at the repo root:
 ```
@@ -58,18 +78,47 @@ It sends:
 
 Check the feeds (terminal 2): `ffplay udp://127.0.0.1:5000` shows the video and `nc -ul 5001` prints the telemetry. Close both before running RAVEN, since only one program can listen on each port.
 
-**9. Run RAVEN** (terminal 2, stop with Ctrl+C)
+**9. Run RAVEN** (terminal 2)
 ```bash
-python -m raven.pipeline
+python -m raven.gui
 ```
-Reads the stream, runs detection, and posts alerts to the channel in `DISCORD_WEBHOOK_URL`, at most one every 10 s. Feed and detection problems print to the terminal.
+In Settings, set a feed's video to `udp://127.0.0.1:5000` and its telemetry to `udp://127.0.0.1:5001`, then start the feeds. The console runs detection and posts alerts to the channel in `DISCORD_WEBHOOK_URL`; each person is alerted once while they stay in view (see Duplicate alerts below). More on the console in [Operator console](#operator-console-srcravengui) below.
 
-**Current status:** detection runs end to end and posts to Discord. Alerts show the drone's position, not the person's, because per-person location isn't built yet. See `docs/TODO.md`. The operator console (below) runs the same detector on recorded flights with a map, alert review and a detection log.
+### Duplicate alerts (FR-12)
+
+Each person is alerted once, then not again while they stay in view. Every drone is tracked separately.
+
+- **With telemetry:** `backend/geotag.py` estimates a ground position for every person box. `RecentPeople` in `backend/scene_similarity.py` treats a person within `SAME_PERSON_RADIUS_M` (15 m) of someone already alerted as the same person. This works while the drone moves, because a still person keeps the same ground position even as their box crosses the frame. A person is forgotten after `DUPLICATE_WINDOW_SECONDS` (10 s, in `discord_bot/subscriber.py`) unseen, and every sighting restarts that window. A new person alerts as soon as the drone's *Discord cooldown* allows (2 s by default, so well within NFR-03's 5 s).
+- **Without telemetry** (or a box geotag can't place): the person boxes are compared with the drone's last alert in the image instead (`scenes_are_similar`). A match needs the same person count and at least 0.5 intersection-over-union for every box (`DEFAULT_IOU_THRESHOLD`). Image boxes only stay put while the drone hovers, so here alerts are also at least 10 s apart.
+
+Matching is one-to-one in both cases, so two people standing together count as two. YOLO still runs on every sampled frame, and every detection is still saved, logged and shown in the console; only Discord alerts are suppressed.
+
+**Current status:** detection runs end to end and posts to Discord. See `docs/TODO.md`.
 
 **Tests**
 ```bash
-python tests/test_curate.py   # or: pip install pytest && pytest
+pip install -r requirements-dev.txt   # once: RAVEN plus pytest
+pytest tests/                         # CI runs the same on every push and PR to main
 ```
+
+**Releasing** (once per sprint, [Semantic Versioning](https://semver.org): `vMAJOR.MINOR.PATCH`)
+
+| Bump | When | Example |
+|---|---|---|
+| PATCH | bug fixes only | `0.2.0` → `0.2.1` |
+| MINOR | new features (the usual sprint) | `0.2.1` → `0.3.0` |
+| MAJOR | breaking changes; `1.0.0` is the first version handed to the sponsor as complete | `0.9.0` → `1.0.0` |
+
+1. Open a PR that changes `version` in `pyproject.toml` (e.g. `0.3.0`) and merge it into `main`.
+2. Tag that merge commit on `main` and push the tag:
+   ```bash
+   git switch main && git pull
+   git tag -a v0.3.0 -m "Sprint 3"
+   git push origin v0.3.0
+   ```
+3. `.github/workflows/release.yml` checks the tag is on `main` and matches `pyproject.toml`, runs the tests, and publishes a GitHub Release with notes built from the merged PR titles (so write clear PR titles). A tag with a hyphen, like `v0.3.0-rc.1`, becomes a pre-release (e.g. before a sponsor demo).
+
+To install a release on the ground computer, download its source zip from GitHub's Releases page and follow Getting started from step 2.
 
 ## Layout
 
@@ -99,7 +148,7 @@ python -m raven.gui --demo       # no model or dataset needed
 
 **Encrypted data.** Everything the console writes to the saved-frames folder (frames, `detections.jsonl`, the Discord outbox) and the accounts file (`runs/accounts.dat`) is encrypted with a key kept in the Windows Credential Manager ("RAVEN operator console"), and decrypted in memory for display and Discord. Files from before encryption are still read. Deleting that credential makes the existing data unreadable.
 
-Inside the console everything goes through RAVEN's Detection Event Bus (bubus), the same events `raven.pipeline` uses: each drone feed publishes `HumanDetected` and `PipelineStatus` events, and the alert list, the Detection Log and Discord alerts subscribe to them. Nothing else needs to be running.
+Inside the console everything goes through RAVEN's Detection Event Bus (bubus), each drone feed publishes `HumanDetected` and `PipelineStatus` events, and the alert list, the Detection Log and Discord alerts subscribe to them. Nothing else needs to be running.
 
 **Demo mode** (`--demo`) generates three 30 s synthetic thermal flights in `runs/demo/` (Drone 1 over Dallas, Drone 2 in the Big Bend desert, Drone 3 in the Piney Woods, each with its own telemetry), and swaps the YOLO model for a simulated detector that marks the warm bodies in that video (hotter people get higher confidence, so the confidence slider visibly changes what's detected). Press **Start**; everything after that (ingest, the event bus, alerts, the detection log, the map, Discord if you turn it on) is the real code path. Each demo launch starts with no alerts. Demo mode saves its settings separately, so they never overwrite your real ones.
 
@@ -118,7 +167,7 @@ The header row has the Map / Feed / Manage / Settings pages (`Ctrl+1`–`4`; Man
   - *Accounts* (administrators only): a table of every account (full name, username, role, assigned drone, duty status). Pick a role in the *Role* dropdown to change the selected account's role right away; add, reset and remove accounts with the buttons. Each person's duty status is the one they set in their profile panel and is kept with their account.
 - **Settings** tab:
   - *Drone feeds* (up to 3): per drone a name (tags its alerts, Discord titles and saved-frames folder), on/off, video file or stream link (with *Test source*) and telemetry: a CSV (checked as soon as it's picked) or `udp://host:port` for live JSON telemetry from the ground station (*Test telemetry* listens for a message). Live UDP telemetry needs a stream link, and every UDP port can only be used once. Start runs every ticked feed in parallel; recorded videos must decode before Start.
-  - Shared by all feeds: confidence threshold (0.70 by default), analysis rate (1–2 frames per second, FR-05), model weights, *Play video files at real speed* (so a recorded flight behaves like a live drone; demo mode turns it on), Discord alerts (required outside demo mode; webhook, cooldown per drone, *Send test alert*, which has to succeed once per launch and after every webhook change before Start), and under *Advanced* the saved-frames folder (which also holds the detection log).
+  - Shared by all feeds: confidence threshold (0.70 by default), analysis rate (1–2 frames per second, FR-05), model weights, *Play video files at real speed* (so a recorded flight behaves like a live drone; demo mode turns it on), Discord alerts (required outside demo mode; webhook, cooldown per drone (2 s by default, see Duplicate alerts), *Send test alert*, which has to succeed once per launch and after every webhook change before Start), and under *Advanced* the saved-frames folder (which also holds the detection log).
   - *Appearance*: whether the console starts in the system, light or dark theme (the header's sun/moon button switches for the current session only), and the accent color: blue, violet, teal, orange or rose. Both apply and save right away.
   - *Keyboard shortcuts*: click a shortcut and press new keys; changes apply and save right away, and a key that's already taken is refused.
   - *Save changes* (`Ctrl+S`) keeps the settings for the next launch; they can also be saved as JSON presets.
@@ -126,7 +175,7 @@ The header row has the Map / Feed / Manage / Settings pages (`Ctrl+1`–`4`; Man
 
 Use the model's weights at the default path (`runs/detect/runs/train/yolov8n_raven/weights/best.pt`) or pick others in Settings. The Discord webhook is read from `DISCORD_WEBHOOK_URL` in `.env` (gitignored) and is never written to presets; failed Discord sends are retried, and the Discord light turns amber while retrying. Alerts not yet sent are kept in `discord_outbox.jsonl` and sent at the next launch; quitting with alerts still waiting asks first. The feeds bar shows each feed's detection time (p90) and lag. Every detection is appended to `detections.jsonl` in the saved-frames folder (`runs/ingest/` by default), so earlier alerts reappear after a restart; reviewed/dismissed marks are remembered.
 
-For the live UDP stream from the ground station, set a feed's video to `udp://127.0.0.1:5000` and its telemetry to `udp://127.0.0.1:5001` (the simulator in `raven.sim.ground_station` sends both), or run `python -m raven.pipeline` (Getting started, step 9).
+For the live UDP stream from the ground station, set a feed's video to `udp://127.0.0.1:5000` and its telemetry to `udp://127.0.0.1:5001` (the simulator in `raven.sim.ground_station` sends both; Getting started, step 9).
 
 ## Dataset validation (`validate_dataset.py`)
 

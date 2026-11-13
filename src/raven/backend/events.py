@@ -26,7 +26,8 @@ class HumanDetected(BaseEvent):
     # the newest live telemetry row when the frame was read, or None if none arrived within 2 s, see TelemetryReceiver.at_time
     telemetry: dict[str, float] | None
 
-    # the detected people, a list of {"box_xyxy": [x1, y1, x2, y2], "confidence": float}
+    # the detected people, a list of {"box_xyxy": [x1, y1, x2, y2], "confidence": float}, plus
+    # "location": {"latitude", "longitude"} on each box whose ground position geotag could estimate
     bounding_boxes: list[dict]
 
     # optional, set by the operator console, which can run several drone feeds at once:

@@ -4,8 +4,15 @@ import time
 import asyncio
 from PIL import Image, ImageDraw
 
-# FR-12: minimum seconds between two alerts, so one sighting doesn't flood the channel
-COOLDOWN_SECONDS = 10
+from raven.backend.scene_similarity import RecentPeople, scenes_are_similar
+
+# FR-12: a person already alerted isn't alerted again while they stay in view; they're forgotten once unseen
+# for this long. Without ground positions (no telemetry) it's also the minimum time between two alerts.
+DUPLICATE_WINDOW_SECONDS = 10
+
+# default minimum seconds between two alerts from one drone when people can be told apart by ground position:
+# only protects the Discord channel from bursts, so a new person waits at most this long (NFR-03: 5 s)
+COOLDOWN_SECONDS = 2
 
 # FR-11.2: seconds to wait before trying a failed alert again
 RETRY_SECONDS = 3
@@ -14,9 +21,11 @@ class DiscordSubscriber:
     """
     Alert Notification subsystem (architecture sections 2.2 and 6): subscribes to HumanDetected on the
     Detection Event Bus and sends alerts to a Discord webhook (FR-11.1, C-03).
-    Keeps track of the Discord webhook, the time of the last alert queued, and the queue of alerts waiting to be sent.
-    Ensures that alerts are not sent too frequently by using a cooldown mechanism (FR-12). Each drone has its own
-    cooldown (events from a single feed all have drone ""), so one busy drone can't hide another drone's sightings.
+    Keeps track of the Discord webhook, who was already alerted, and the queue of alerts waiting to be sent.
+    Suppresses duplicate alerts for people already alerted (FR-12): by ground position when geotag estimated one
+    for every person, otherwise by comparing person boxes with the last alert, behind a DUPLICATE_WINDOW_SECONDS
+    cooldown. Each drone has its own state (events from a single feed all have drone ""), so one busy drone
+    can't hide another drone's sightings.
     on_sent(event) and on_error(event, error) are optional callbacks (the operator console's status light uses them).
     Failed alerts are retried until delivered (FR-11.2, NFR-09). The queue is held in memory, so it covers
     network and Discord outages, but alerts still waiting are lost if RAVEN itself stops.
@@ -28,27 +37,70 @@ class DiscordSubscriber:
         self.on_sent = on_sent
         self.on_error = on_error
 
-        # time of the last alert queued, per drone
+        # per drone: time of the last alert queued, boxes of the last alert queued, time of the last positive
+        # detection, and the people already alerted (RecentPeople)
         self.last_alert_times = {}
+        self.last_alert_boxes = {}
+        self.last_detection_times = {}
+        self.recent_people = {}
         self.alerts = asyncio.Queue()
 
     async def on_human_detected(self, event):
         """
         Bus handler for HumanDetected, published only for detections at or above the threshold (FR-10.1).
-        Checks the cooldown (FR-12) and adds the alert to the queue for deliver_alerts() to send. It never waits
+        Queues an alert for deliver_alerts() when the frame shows someone not yet alerted (FR-12). It never waits
         on Discord, so a slow or failed upload can't hold up the event loop or the pipeline (NFR-05, architecture section 5.2).
         """
-
-        # check if we should alert based on this drone's cooldown (FR-12)
         drone = getattr(event, "drone", "")
-        if not should_alert(event, self.last_alert_times.get(drone), self.cooldown):
+
+        # Empty frames do not publish HumanDetected. A gap in this drone's positive events re-arms the box
+        # comparison, so people returning to the same positions can trigger another alert.
+        last_detection = self.last_detection_times.get(drone)
+        if last_detection is not None and event.time - last_detection > DUPLICATE_WINDOW_SECONDS:
+            self.last_alert_boxes.pop(drone, None)
+        self.last_detection_times[drone] = event.time
+
+        locations = [box.get("location") for box in event.bounding_boxes]
+        new = []
+        if locations and all(locations):
+            people = self.recent_people.setdefault(drone, RecentPeople(DUPLICATE_WINDOW_SECONDS))
+            new = people.new_people(locations, event.time)
+            # a new person held back by the cooldown stays new, so the next frame alerts for them
+            if not new or not should_alert(event, self.last_alert_times.get(drone), self.cooldown):
+                return
+        elif not self._new_scene(event, drone):
             return
 
         # add the event to the queue, where it is retried until delivered (FR-11.2)
-        await self.alerts.put(event)
+        self.queue_alert(event)
+        if new:
+            # only once queueing succeeded: if the outbox write raised, they stay new and the next frame retries (NFR-09)
+            people.remember(new, event.time)
 
         # start the cooldown when queued, not when sent, or every frame during an outage would queue another alert (FR-12)
         self.last_alert_times[drone] = event.time
+        # Keep the last queued scene as the reference. Updating it for skipped events would hide
+        # gradual movement or consume a changed scene while the cooldown is still active.
+        self.last_alert_boxes[drone] = [
+            {"box_xyxy": list(box["box_xyxy"])} for box in event.bounding_boxes
+        ]
+
+    def _new_scene(self, event, drone):
+        """
+        Fallback when some person has no ground position: boxes in the image can't follow people while the camera
+        moves, so FR-12's window is kept as a cooldown, and after it only a changed scene alerts.
+        """
+        if not should_alert(event, self.last_alert_times.get(drone), max(self.cooldown, DUPLICATE_WINDOW_SECONDS)):
+            return False
+        previous_boxes = self.last_alert_boxes.get(drone)
+        return previous_boxes is None or not scenes_are_similar(event.bounding_boxes, previous_boxes)
+
+    def queue_alert(self, event):
+        """
+        Put an alert that passed the cooldown and similarity checks on the queue. Subclasses override it to also
+        keep a durable copy (the console's outbox), so only alerts that will really be sent are recorded.
+        """
+        self.alerts.put_nowait(event)
 
     async def deliver_alerts(self):
         """
