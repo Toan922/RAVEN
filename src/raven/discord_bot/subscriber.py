@@ -61,18 +61,21 @@ class DiscordSubscriber:
         self.last_detection_times[drone] = event.time
 
         locations = [box.get("location") for box in event.bounding_boxes]
+        new = []
         if locations and all(locations):
             people = self.recent_people.setdefault(drone, RecentPeople(DUPLICATE_WINDOW_SECONDS))
             new = people.new_people(locations, event.time)
             # a new person held back by the cooldown stays new, so the next frame alerts for them
             if not new or not should_alert(event, self.last_alert_times.get(drone), self.cooldown):
                 return
-            people.remember(new, event.time)
         elif not self._new_scene(event, drone):
             return
 
         # add the event to the queue, where it is retried until delivered (FR-11.2)
         self.queue_alert(event)
+        if new:
+            # only once queueing succeeded: if the outbox write raised, they stay new and the next frame retries (NFR-09)
+            people.remember(new, event.time)
 
         # start the cooldown when queued, not when sent, or every frame during an outage would queue another alert (FR-12)
         self.last_alert_times[drone] = event.time

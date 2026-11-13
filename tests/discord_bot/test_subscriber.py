@@ -216,6 +216,30 @@ def test_frame_without_ground_positions_falls_back_to_the_window():
     asyncio.run(scenario())
 
 
+def test_failed_outbox_write_does_not_mark_people_as_alerted():
+    # If queueing raises (the console's outbox write failed), the person must stay new so the next frame retries.
+    class FailingOnce(DiscordSubscriber):
+        failures = 1
+
+        def queue_alert(self, event):
+            if self.failures:
+                self.failures -= 1
+                raise OSError("disk full")
+            super().queue_alert(event)
+
+    async def scenario():
+        subscriber = FailingOnce(object())
+        try:
+            await subscriber.on_human_detected(located(0, [(300, 0)]))
+        except OSError:
+            pass
+        for timestamp in (1, 2):
+            await subscriber.on_human_detected(located(timestamp, [(300, 0)]))
+        assert queued_times(subscriber) == [1]
+
+    asyncio.run(scenario())
+
+
 def test_discord_labels_approximate_and_unavailable_locations(make_event):
     estimated = create_discord_alert(make_event(telemetry={"latitude": 1.0, "longitude": 2.0},
                                             location={"latitude": 1.5, "longitude": 2.5}, location_status="estimated"))
@@ -240,4 +264,5 @@ if __name__ == "__main__":
     test_people_standing_together_are_counted_separately()
     test_person_is_forgotten_only_after_the_window_unseen()
     test_frame_without_ground_positions_falls_back_to_the_window()
+    test_failed_outbox_write_does_not_mark_people_as_alerted()
     print("Discord subscriber tests passed")
