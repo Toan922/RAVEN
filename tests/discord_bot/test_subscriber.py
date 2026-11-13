@@ -8,6 +8,7 @@ from raven.discord_bot.subscriber import (
     COOLDOWN_SECONDS,
     DUPLICATE_WINDOW_SECONDS,
     DiscordSubscriber,
+    alert_people,
     create_discord_alert,
 )
 
@@ -240,15 +241,57 @@ def test_failed_outbox_write_does_not_mark_people_as_alerted():
     asyncio.run(scenario())
 
 
-def test_discord_labels_approximate_and_unavailable_locations(make_event):
-    estimated = create_discord_alert(make_event(telemetry={"latitude": 1.0, "longitude": 2.0},
-                                            location={"latitude": 1.5, "longitude": 2.5}, location_status="estimated"))
-    assert estimated.fields[0].name == "Location" and estimated.fields[0].value.startswith("1.50000, 2.50000")
-    approximate = create_discord_alert(make_event(telemetry={"latitude": 1.0, "longitude": 2.0}))
-    assert "Approximate (drone position)" in approximate.fields[0].name
-    missing = create_discord_alert(make_event(location_status="unavailable"))
-    assert missing.fields[0].value == "Location not available"
+def test_alert_has_one_line_per_person_with_a_labelled_location(make_event):
+    # FR-10.2, FR-09, NFR-06: one field per person, numbered by confidence, with the classification, their
+    # confidence and their own location in decimal degrees; approximate and unavailable locations are labelled
+    event = make_event(telemetry={"latitude": 1.0, "longitude": 2.0}, bounding_boxes=[
+        {"box_xyxy": [0, 0, 1, 1], "confidence": 0.84},                                                  # not placed
+        {"box_xyxy": [5, 5, 6, 6], "confidence": 0.91, "location": {"latitude": 1.5, "longitude": 2.5}},
+    ])
+    fields = create_discord_alert(event).fields
+    assert [field.name for field in fields] == ["Person 1 · Human · 0.91", "Person 2 · Human · 0.84"]
+    assert fields[0].value == "1.50000, 2.50000 · [Open in Google Maps](https://www.google.com/maps/search/?api=1&query=1.5,2.5)"
+    assert fields[1].value.startswith("Approximate (drone position): 1.00000, 2.00000 · [Open in Google Maps](")
 
+    missing = create_discord_alert(make_event(telemetry=None)).fields
+    assert [(field.name, field.value) for field in missing] == [("Person 1 · Human · 0.90", "Location unavailable")]
+
+
+def test_crowded_alert_lists_the_most_confident_people_then_a_count(make_event):
+    # Discord rejects embeds over 25 fields, and a rejected alert would retry forever (FR-11.2)
+    boxes = [{"box_xyxy": [i, 0, i + 1, 1], "confidence": 0.5 + i / 100} for i in range(30)]
+    fields = create_discord_alert(make_event(bounding_boxes=boxes)).fields
+    assert len(fields) == 11
+    assert fields[0].name == "Person 1 · Human · 0.79"
+    assert (fields[-1].name, fields[-1].value) == ("More people", "+20 more in the image")
+
+
+def test_people_are_numbered_by_confidence_with_their_own_location(make_event):
+    # FR-08, FR-09, FR-10.2: every person gets a number (highest confidence first), their own ground location,
+    # and a status; a person geotag couldn't place falls back to the drone's position, labelled approximate
+    drone = {"latitude": 32.0, "longitude": -96.0}
+    telemetry = dict(drone, altitude_agl_m=85.0, heading_deg=0.0, camera_depression_deg=50.0, t=100.0)
+    a = {"latitude": 32.0001, "longitude": -96.0001}
+    c = {"latitude": 32.0002, "longitude": -96.0002}
+    event = make_event(telemetry=telemetry, bounding_boxes=[
+        {"box_xyxy": [10, 10, 23, 27], "confidence": 0.72, "location": a},    # A
+        {"box_xyxy": [100, 50, 113, 67], "confidence": 0.91},                 # B: no ground position
+        {"box_xyxy": [200, 90, 213, 107], "confidence": 0.84, "location": c},  # C
+    ])
+
+    assert alert_people(event) == [
+        {"number": 1, "box": [100, 50, 113, 67], "confidence": 0.91, "location": drone, "status": "approximate"},
+        {"number": 2, "box": [200, 90, 213, 107], "confidence": 0.84, "location": c, "status": "estimated"},
+        {"number": 3, "box": [10, 10, 23, 27], "confidence": 0.72, "location": a, "status": "estimated"},
+    ]
+
+
+def test_people_without_position_data_are_unavailable(make_event):
+    # FR-09: no telemetry, or a row without both coordinates, means no location at all, and the alert still sends
+    box = {"box_xyxy": [10, 10, 23, 27], "confidence": 0.9}
+    unavailable = [{"number": 1, "box": [10, 10, 23, 27], "confidence": 0.9, "location": None, "status": "unavailable"}]
+    assert alert_people(make_event(telemetry=None, bounding_boxes=[box])) == unavailable
+    assert alert_people(make_event(telemetry={"latitude": 32.0, "altitude_agl_m": 85.0}, bounding_boxes=[box])) == unavailable
 
 if __name__ == "__main__":
     test_continuously_observed_scene_stays_suppressed_after_cooldown()
